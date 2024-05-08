@@ -1,0 +1,29 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: ifm_perturbation.py",
+            "type": "python",
+            "request": "launch",
+            "program": "/home/dfl32/project/ifm/ifm_perturbation.py",
+            "args": [
+                "--wandb_logging", "True",
+                "--wandb_run_base_name", "ifm_test",
+                "--model_name", "EleutherAI/pythia-160m",
+                "--llm_dataset_path", "/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_hf_ds",
+                "--train_gaussian", "True",
+                "--use_vae", "True",
+                "--logging_steps", "1",
+                "--eval_steps", "1",
+                "--eval_dataset_size", "50",
+                "--train_dataset_size", "4500",
+                "--time_points", "2",
+                "--normalize_output", "True",
+                "--e2e", "True"
+            ]
+        }
+    ]
+}

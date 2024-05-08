@@ -1,0 +1,5 @@
+{
+    "prefix": [
+        "Stimulate the following {cell_type} cell with {perturbation}: "
+    ]
+}
