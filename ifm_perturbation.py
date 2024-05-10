@@ -22,13 +22,16 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
     EarlyStoppingCallback,
-    TrainingArguments
+    TrainingArguments,
+    GPTNeoXForCausalLM,
+    GPTNeoXConfig
 )
 from optimum.bettertransformer import BetterTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from utils.combo_split import combo_split_nochron
 from utils.custom_trainer import LLMVAETrainer
+from utils.modules import CustomDecoder, CustomVAEDecoder
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -226,10 +229,40 @@ def parse_arguments():
         type=bool,
         default=False
     )
+    parser.add_argument(
+        "--straight_paths",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--skip_conn_dec",
+        type=bool,
+        default=True
+    )
+    parser.add_argument(
+        "--target_dist",
+        type=str,
+        default=None
+    )
+    parser.add_argument(
+        "--target_dim",
+        type=int,
+        default=5000
+    )
+    parser.add_argument(
+        "--just_llm",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--train_2d",
+        type=bool,
+        default=False
+    )
     return parser.parse_args()
 
 
-def generate_paths(X_0, X_1, sigma=0.1, time_points=16):
+def generate_paths(X_0, X_1, sigma=0.0001, time_points=16, straight_paths=False):
     # Convert lists to tensors
     X_0 = torch.tensor(X_0, dtype=torch.float32)
     X_1 = torch.tensor(X_1, dtype=torch.float32)
@@ -250,6 +283,9 @@ def generate_paths(X_0, X_1, sigma=0.1, time_points=16):
     paths = path_means.clone()
     
     # Gaussian noise: zero mean, sigma standard deviation, but not for the first and last time points
+    if straight_paths:
+        return paths
+    
     if time_points > 2:
         noise = sigma * torch.randn(time_points-2, dim)
         
@@ -304,34 +340,45 @@ def main(args):
     # trust_remote_code executes custom code uploaded to the HF hub
     logger.info(f"loading model {args.model_name}")
     device = torch.device("cuda")
-    if not args.checkpoint:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            use_flash_attention_2=args.use_flash_attention_2).to(device)
+    if args.train_2d:
+        config = GPTNeoXConfig(
+            hidden_size=32,
+            intermediate_size=32,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            vocab_size=100,
+            use_flash_attention_2=args.use_flash_attention_2
+            )
+        model = GPTNeoXForCausalLM(config).to(device)
     else:
-        logger.info(f"Reloading model from checkpoint: {args.checkpoint}")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.checkpoint,
-            use_flash_attention_2=args.use_flash_attention_2).to(device)
+        if not args.checkpoint:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
+                use_flash_attention_2=args.use_flash_attention_2).to(device)
+        else:
+            logger.info(f"Reloading model from checkpoint: {args.checkpoint}")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.checkpoint,
+                use_flash_attention_2=args.use_flash_attention_2).to(device)
 
-    if (args.max_context_length is not None) and (model.config.max_position_embeddings < args.max_context_length):
-        logger.info(f"Max position embeddings increased.")
-        model.config.max_position_embeddings = args.max_context_length
-        # Need to reinstantiate rotary embeddings to adjust for change in context length
-        if ("pythia" in args.model_name) and (args.checkpoint is None):
+        if (args.max_context_length is not None) and (model.config.max_position_embeddings < args.max_context_length):
+            logger.info(f"Max position embeddings increased.")
+            model.config.max_position_embeddings = args.max_context_length
+            # Need to reinstantiate rotary embeddings to adjust for change in context length
+            if ("pythia" in args.model_name) and (args.checkpoint is None):
 
-            logger.info(f"No checkpoint found, but max position embeddings increased. Reinstantiating rotary positional embeddings.")
-            from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXRotaryEmbedding
+                logger.info(f"No checkpoint found, but max position embeddings increased. Reinstantiating rotary positional embeddings.")
+                from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXRotaryEmbedding
 
-            for i in range(len(model.gpt_neox.layers)):
-                dim = model.gpt_neox.layers[i].attention.rotary_emb.dim
-                base = model.gpt_neox.layers[i].attention.rotary_emb.base
+                for i in range(len(model.gpt_neox.layers)):
+                    dim = model.gpt_neox.layers[i].attention.rotary_emb.dim
+                    base = model.gpt_neox.layers[i].attention.rotary_emb.base
 
-                model.gpt_neox.layers[i].attention.rotary_emb = GPTNeoXRotaryEmbedding(
-                    dim=dim,
-                    max_position_embeddings=model.config.max_position_embeddings,
-                    base=base
-                ).to(device)
+                    model.gpt_neox.layers[i].attention.rotary_emb = GPTNeoXRotaryEmbedding(
+                        dim=dim,
+                        max_position_embeddings=model.config.max_position_embeddings,
+                        base=base
+                    ).to(device)
 
     if args.gradient_checkpointing:
         logger.info(f"Using gradient checkpointing. Setting use_cache to False.")
@@ -375,7 +422,7 @@ def main(args):
             prefix = prompts['prefix'][0].format(cell_type=cell_type, perturbation=perturbation)
             ctr_expr = examples['ctr_expr'][i]
             pert_expr = examples['pert_expr'][i]
-            path = generate_paths(ctr_expr, pert_expr, sigma=args.path_var, time_points=args.time_points)
+            path = generate_paths(ctr_expr, pert_expr, sigma=args.path_var, time_points=args.time_points, straight_paths=args.straight_paths)
             prefixes.append(prefix)
             examples['path'].append(path)
         examples['prefix'] = tokenizer(prefixes, truncation=True, max_length=args.max_context_length)['input_ids']
@@ -452,25 +499,46 @@ def main(args):
 
     if args.train_gaussian:
         input_dim = len(val_dataset[0]['expr'])
-        model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
-        if args.use_vae:
-            model.mean_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-            model.var_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-            model.var_activation = vae.module.z_encoder.var_activation
-            model.var_eps = vae.module.z_encoder.var_eps
-            model.decoder = nn.Sequential(
-                nn.Linear(model.config.hidden_size, model.config.hidden_size),
-                nn.LayerNorm(model.config.hidden_size, elementwise_affine=False),
-                nn.ReLU(),
-                nn.Dropout(p=0.1),
-                nn.Linear(model.config.hidden_size, model.config.hidden_size),
-                nn.LayerNorm(model.config.hidden_size, elementwise_affine=False),
-                nn.ReLU(),
-                nn.Dropout(p=0.1),
-                nn.Linear(model.config.hidden_size, input_dim)
-            ).to(device)
+        if args.just_llm:
+            model.decoder = nn.Linear(model.config.hidden_size, input_dim)
+        elif args.train_2d:
+            input_dim = 2
+            model.cell_enc = nn.Linear(input_dim, model.config.hidden_size)
+            if args.use_vae:
+                model.cell_dec = CustomVAEDecoder(
+                    hidden_size=model.config.hidden_size,
+                    input_dim=input_dim,
+                    device=model.device,
+                    num_blocks=1
+                )
+            else:
+                model.cell_dec = nn.Linear(model.config.hidden_size, input_dim)
         else:
-            model.cell_dec = nn.Linear(model.config.hidden_size, input_dim).to(device)
+            model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
+            if args.use_vae:
+                model.mean_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
+                model.var_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
+                model.var_activation = vae.module.z_encoder.var_activation
+                model.var_eps = vae.module.z_encoder.var_eps
+                # Assuming 'model.config.hidden_size', 'input_dim', and 'device' are defined
+                model.decoder = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
+                # model.decoder = nn.Sequential(
+                #     nn.Linear(model.config.hidden_size, input_dim),
+                #     nn.LayerNorm(input_dim, elementwise_affine=False),
+                #     nn.ReLU(),
+                #     nn.Dropout(p=0.1),
+                #     nn.Linear(input_dim, input_dim),
+                #     nn.LayerNorm(input_dim, elementwise_affine=False),
+                #     nn.ReLU(),
+                #     nn.Dropout(p=0.1),
+                #     nn.Linear(input_dim, input_dim),
+                #     nn.LayerNorm(input_dim, elementwise_affine=False),
+                #     nn.ReLU(),
+                #     nn.Dropout(p=0.1),
+                #     nn.Linear(input_dim, input_dim)
+                # ).to(device)
+            else:
+                model.cell_dec = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
     else:
         model.cell_enc = vae.module.z_encoder.encoder.to(device)
         model.cell_proj_in = nn.Linear(model.cell_enc.fc_layers[-1][0].out_features, model.config.hidden_size).to(device)
@@ -492,6 +560,8 @@ def main(args):
             model.px_r = vae.module.px_r
             model.decoder = vae.module.decoder.to(device)
 
+    logger.info(model)
+
     dc = data_collator
     if args.train_gaussian:
         dc = data_collator_gaussian
@@ -509,7 +579,12 @@ def main(args):
         e2e=args.e2e,
         train_gaussian=args.train_gaussian,
         time_points=args.time_points,
-        use_vae=args.use_vae
+        use_vae=args.use_vae,
+        straight_paths=args.straight_paths,
+        target_dist=args.target_dist,
+        target_dim=args.target_dim,
+        just_llm=args.just_llm,
+        train_2d=args.train_2d
     )
 
     resume_from_checkpoint = args.resume_from_checkpoint

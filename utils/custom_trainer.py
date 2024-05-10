@@ -65,6 +65,11 @@ class LLMVAETrainer(Trainer):
         train_gaussian=False,
         time_points=16,
         use_vae=False,
+        straight_paths=False,
+        target_dist=None,
+        target_dim=5000,
+        just_llm=False,
+        train_2d=False,
         **args
     ):
         super().__init__(**args)
@@ -75,6 +80,11 @@ class LLMVAETrainer(Trainer):
         self.train_gaussian = train_gaussian
         self.time_points = time_points
         self.use_vae = use_vae
+        self.straight_paths = straight_paths
+        self.target_dist = target_dist
+        self.target_dim = target_dim
+        self.just_llm = just_llm
+        self.train_2d = train_2d
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -195,8 +205,23 @@ class LLMVAETrainer(Trainer):
         model.train()
         # inputs = self._prepare_inputs(inputs)
         if self.train_gaussian:
-            X = torch.tensor(inputs['exprs']).to(model.device)
-            model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
+            if self.target_dist in ('gaussian', 'checkerboard', 'bimodal'):
+                batch_size = self.args.per_device_train_batch_size
+                target_dim = self.target_dim
+                if self.train_2d:
+                    target_dim = 2
+                if self.target_dist == 'checkerboard':
+                    X = self.generate_checkerboard_samples(batch_size).to(model.device)
+                elif self.target_dist == 'bimodal':
+                    X = self.generate_bimodal_samples(batch_size).to(model.device)
+                else:
+                    X = torch.normal(0.0, 1.0, size=(batch_size, target_dim)).to(model.device)
+            else:   
+                X = torch.tensor(inputs['exprs']).to(model.device)
+            if self.straight_paths:
+                model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+            else:
+                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
             labels = model_inputs.detach().clone()
             token_masks = None
         else:
@@ -274,17 +299,23 @@ class LLMVAETrainer(Trainer):
         """
         with autocast():
             if self.train_gaussian:
-                outputs = model.cell_enc(inputs)
-                outputs = model.gpt_neox(inputs_embeds=outputs)
-                if self.use_vae:
-                    mean = model.mean_encoder(outputs.last_hidden_state)
-                    var = model.var_encoder(outputs.last_hidden_state)
-                    var = model.var_activation(var) + model.var_eps
-                    cond_dist = Normal(mean, var.sqrt())
-                    latent = cond_dist.sample()
-                    outputs = model.decoder(latent)
+                if self.just_llm:
+                    outputs = model.gpt_neox(inputs_embeds=inputs).last_hidden_state
+                    outputs = model.decoder(outputs)
                 else:
-                    outputs = model.cell_dec(outputs.last_hidden_state)
+                    outputs = model.cell_enc(inputs)
+                    outputs = model.gpt_neox(inputs_embeds=outputs)
+                    # if self.use_vae:
+                    #     mean = model.mean_encoder(outputs.last_hidden_state)
+                    #     var = model.var_encoder(outputs.last_hidden_state)
+                    #     var = model.var_activation(var) + model.var_eps
+                    #     cond_dist = Normal(mean, var.sqrt())
+                    #     latent = cond_dist.sample()
+                    #     outputs = model.decoder(latent)
+                    if self.use_vae:
+                        outputs, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
+                    else:
+                        outputs = model.cell_dec(outputs.last_hidden_state)
             else:
                 outputs = model.gpt_neox(**inputs)
                 outputs = model.cell_proj_out(outputs.last_hidden_state)
@@ -321,7 +352,7 @@ class LLMVAETrainer(Trainer):
                 loss = loss_fn(outputs_for_loss, labels)
 
                 if self.train_gaussian and self.use_vae:
-                    pz = Normal(torch.zeros_like(latent), torch.ones_like(latent))
+                    pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
                     kl_divergence_z = kl_divergence(
                         cond_dist,
                         pz
@@ -362,8 +393,23 @@ class LLMVAETrainer(Trainer):
         """
 
         if self.train_gaussian:
-            X = torch.tensor(inputs['exprs']).to(model.device)
-            model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
+            if self.target_dist in ('gaussian', 'checkerboard', 'bimodal'):
+                batch_size = self.args.per_device_eval_batch_size
+                target_dim = self.target_dim
+                if self.train_2d:
+                    target_dim = 2
+                if self.target_dist == 'checkerboard':
+                    X = self.generate_checkerboard_samples(batch_size).to(model.device)
+                elif self.target_dist == 'bimodal':
+                    X = self.generate_bimodal_samples(batch_size).to(model.device)
+                else:
+                    X = torch.normal(0.0, 1.0, size=(batch_size, target_dim)).to(model.device)
+            else:  
+                X = torch.tensor(inputs['exprs']).to(model.device)
+            if self.straight_paths:
+                model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+            else:
+                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
             labels = model_inputs.detach().clone()
             token_masks = None
         else:
@@ -487,8 +533,22 @@ class LLMVAETrainer(Trainer):
 
         return loss
 
-    def generate_noise_paths(self, Y, sigma=0.1, device='cuda', time_points=16):
-        X = torch.normal(0, 0.1**0.5, size=Y.shape).to(device)
+    def generate_noise_paths(self, Y, sigma=0.0001, device='cuda', time_points=16):
+        X = torch.normal(0.0, 1.0**0.5, size=Y.shape).to(device)
+        W = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
+        W[:, 0, :] = X
+        W[:, 1, :] = Y
+        # Define the time points, evenly spaced from 0 to 1, inclusive
+        times = torch.linspace(0, 1, time_points)
+
+        # Generate W where each slice W[:, i, :] is based on the linear combination of X and Y
+        for i, t in enumerate(times[1:-1]):
+            W[:, i, :] = torch.normal((1 - t) * X + t * Y, sigma**0.5).to(device)
+
+        return W.to(dtype=torch.float32)
+
+    def generate_straight_paths(self, Y, device='cuda', time_points=16):
+        X = torch.normal(0.0, 1.0, size=Y.shape).to(device)
         W = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
 
         # Define the time points, evenly spaced from 0 to 1, inclusive
@@ -496,6 +556,51 @@ class LLMVAETrainer(Trainer):
 
         # Generate W where each slice W[:, i, :] is based on the linear combination of X and Y
         for i, t in enumerate(times):
-            W[:, i, :] = torch.normal((1 - t) * X + t * Y, 0.1**0.5).to(device)
+            W[:, i, :] = (((1 - t) * X) + (t * Y)).to(device)
 
         return W.to(dtype=torch.float32)
+
+    def generate_checkerboard_samples(self, num_samples):
+        # Initialize array to store samples
+        samples = np.zeros((num_samples, 2))
+        
+        # List of supported squares, each defined by the lower bound corner (x, y)
+        supported_squares = []
+        for x in range(-4, 4, 2):  # from -4 to 2, stepping by 2
+            for y in range(-4, 4, 2):  # from -4 to 2, stepping by 2
+                if (x // 2 + y // 2) % 2 == 0:  # checkerboard pattern condition
+                    supported_squares.append((x, y))
+        
+        # Generate samples
+        for i in range(num_samples):
+            # Choose a random square from the supported squares
+            square = supported_squares[np.random.randint(len(supported_squares))]
+            # Generate a random point within this square
+            samples[i, 0] = np.random.uniform(square[0], square[0] + 2)
+            samples[i, 1] = np.random.uniform(square[1], square[1] + 2)
+        
+        return torch.tensor(samples)
+
+    def generate_bimodal_samples(self, num_samples):
+        # Define the means for the two modes
+        mean1 = torch.tensor([-1.0, -1.0])
+        mean2 = torch.tensor([1.0, 1.0])
+
+        # Standard deviation for both modes (standard normal)
+        std = torch.tensor([1.0, 1.0])
+
+        # Half samples from each mode
+        num_samples_mode = num_samples // 2
+
+        # Generate samples for each mode
+        samples_mode1 = torch.normal(mean1, std).repeat(num_samples_mode, 1)
+        samples_mode2 = torch.normal(mean2, std).repeat(num_samples_mode, 1)
+
+        # Concatenate samples from both modes
+        samples = torch.cat((samples_mode1, samples_mode2), dim=0)
+
+        # Shuffle the samples to mix modes
+        indices = torch.randperm(num_samples)
+        shuffled_samples = samples[indices]
+
+        return shuffled_samples

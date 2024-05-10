@@ -19,21 +19,14 @@ conda activate c2s2
 cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
 
-python ifm_perturbation.py \
+python ifm_deterministic.py \
     --model_name EleutherAI/pythia-160m \
-    --llm_dataset_path /home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_768_hf_ds \
+    --llm_dataset_path /home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_hf_ds \
     --num_train_epochs 100 \
-    --train_gaussian True \
     --time_points 16 \
-    --max_context_length 50 \
-    --max_num_blocks 32 \
     --per_device_train_batch_size 128 \
     --per_device_eval_batch_size 128 \
     --eval_accumulation_steps 5 \
     --gradient_accumulation_steps 1 \
-    --normalize_output True \
     --save_steps 1000 \
-    --e2e True \
     --straight_paths True \
-    --target_dist bimodal \
-    --train_2d True \
