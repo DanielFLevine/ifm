@@ -13,6 +13,7 @@ from torch import nn
 from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torch.nn import MSELoss
+import torch.nn.functional as F
 from transformers import Trainer
 from transformers.trainer import is_datasets_available, _is_peft_model
 from transformers.training_args import ParallelMode
@@ -70,6 +71,12 @@ class LLMVAETrainer(Trainer):
         target_dim=5000,
         just_llm=False,
         train_2d=False,
+        ifm_reg=False,
+        kl_weight=1.0,
+        sigma_decay=False,
+        sigma_min=0.0001,
+        sigma_max=0.01,
+        dropout_p=0.0,
         **args
     ):
         super().__init__(**args)
@@ -85,6 +92,12 @@ class LLMVAETrainer(Trainer):
         self.target_dim = target_dim
         self.just_llm = just_llm
         self.train_2d = train_2d
+        self.ifm_reg = ifm_reg
+        self.kl_weight = kl_weight
+        self.sigma_decay = sigma_decay
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.dropout_p = dropout_p
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -221,7 +234,7 @@ class LLMVAETrainer(Trainer):
             if self.straight_paths:
                 model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
             else:
-                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
+                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
             labels = model_inputs.detach().clone()
             token_masks = None
         else:
@@ -340,6 +353,11 @@ class LLMVAETrainer(Trainer):
                 return self.vae_loss(x, inf_dict, gen_dict)
             else:
                 outputs_for_loss = outputs[:, :-1, :].contiguous()
+                if self.ifm_reg:
+                    start = labels[:, 0, :]
+                    end = labels[:, -1, :]
+                    reg_weight = (end-start).unsqueeze(1)
+                    reg_weight = reg_weight*0.1
                 labels = labels[:, 1:, :].contiguous()
                 if not self.train_gaussian:
                     token_masks = token_masks[:, :-1].contiguous().float()
@@ -349,6 +367,8 @@ class LLMVAETrainer(Trainer):
                 if self.train_gaussian and self.use_vae:
                     reduction = 'none'
                 loss_fn = MSELoss(reduction=reduction)
+                if self.ifm_reg:
+                    outputs_for_loss += outputs_for_loss*reg_weight
                 loss = loss_fn(outputs_for_loss, labels)
 
                 if self.train_gaussian and self.use_vae:
@@ -358,7 +378,7 @@ class LLMVAETrainer(Trainer):
                         pz
                     ).sum(dim=-1)[:,:-1]
 
-                    loss = torch.mean(loss.sum(-1) + kl_divergence_z)
+                    loss = torch.mean(loss.sum(-1) + (kl_divergence_z*self.kl_weight))
                 return (loss, outputs) if return_outputs else loss
 
     def prediction_step(
@@ -409,7 +429,7 @@ class LLMVAETrainer(Trainer):
             if self.straight_paths:
                 model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
             else:
-                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points)
+                model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
             labels = model_inputs.detach().clone()
             token_masks = None
         else:
@@ -539,10 +559,12 @@ class LLMVAETrainer(Trainer):
         W[:, 0, :] = X
         W[:, 1, :] = Y
         # Define the time points, evenly spaced from 0 to 1, inclusive
-        times = torch.linspace(0, 1, time_points)
+        times = torch.linspace(0, 1, time_points).to(device)
 
         # Generate W where each slice W[:, i, :] is based on the linear combination of X and Y
         for i, t in enumerate(times[1:-1]):
+            if self.sigma_decay:
+                sigma = ((1-t)*self.sigma_max) + (t*self.sigma_min)
             W[:, i, :] = torch.normal((1 - t) * X + t * Y, sigma**0.5).to(device)
 
         return W.to(dtype=torch.float32)
@@ -557,8 +579,11 @@ class LLMVAETrainer(Trainer):
         # Generate W where each slice W[:, i, :] is based on the linear combination of X and Y
         for i, t in enumerate(times):
             W[:, i, :] = (((1 - t) * X) + (t * Y)).to(device)
-
-        return W.to(dtype=torch.float32)
+        
+        W = W.to(dtype=torch.float32)
+        if self.dropout_p > 0.0:
+            W = F.dropout(W, p=self.dropout_p, training=True)
+        return W
 
     def generate_checkerboard_samples(self, num_samples):
         # Initialize array to store samples
@@ -583,18 +608,19 @@ class LLMVAETrainer(Trainer):
 
     def generate_bimodal_samples(self, num_samples):
         # Define the means for the two modes
-        mean1 = torch.tensor([-1.0, -1.0])
-        mean2 = torch.tensor([1.0, 1.0])
+        num_samples_mode = num_samples // 2
+        mean1 = torch.tensor([[-2.0, -2.0]]*num_samples_mode)
+        mean2 = torch.tensor([[2.0, 2.0]]*num_samples_mode)
 
         # Standard deviation for both modes (standard normal)
-        std = torch.tensor([1.0, 1.0])
+        std = torch.tensor([[1.0, 1.0]]*num_samples_mode)
 
         # Half samples from each mode
         num_samples_mode = num_samples // 2
 
         # Generate samples for each mode
-        samples_mode1 = torch.normal(mean1, std).repeat(num_samples_mode, 1)
-        samples_mode2 = torch.normal(mean2, std).repeat(num_samples_mode, 1)
+        samples_mode1 = torch.normal(mean1, std)
+        samples_mode2 = torch.normal(mean2, std)
 
         # Concatenate samples from both modes
         samples = torch.cat((samples_mode1, samples_mode2), dim=0)

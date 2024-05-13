@@ -17,7 +17,7 @@ class ResidualBlock(nn.Module):
         out = self.norm(out)
         out = self.relu(out)
         out = self.dropout(out)
-        out += identity  # Skip connection
+        # out += identity  # Skip connection
         return out
 
 class CustomDecoder(nn.Module):
@@ -45,8 +45,8 @@ class CustomDecoder(nn.Module):
 class CustomVAEDecoder(nn.Module):
     def __init__(self, hidden_size, input_dim, device, num_blocks=1):
         super(CustomVAEDecoder, self).__init__()
-        self.mean_encoder = nn.Linear(hidden_size, hidden_size).to(device)
-        self.var_encoder = nn.Linear(hidden_size, hidden_size).to(device)
+        self.mean_encoder = ResidualBlock(hidden_size).to(device)
+        self.var_encoder = ResidualBlock(hidden_size).to(device)
         self.var_activation = torch.exp
         self.var_eps = 0.0001
         self.decoder = CustomDecoder(

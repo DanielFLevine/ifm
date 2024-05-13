@@ -259,6 +259,61 @@ def parse_arguments():
         type=bool,
         default=False
     )
+    parser.add_argument(
+        "--hdim_2d",
+        type=int,
+        default=32
+    )
+    parser.add_argument(
+        "--idim_2d",
+        type=int,
+        default=32
+    )
+    parser.add_argument(
+        "--nheads_2d",
+        type=int,
+        default=4
+    )
+    parser.add_argument(
+        "--nblocks_2d",
+        type=int,
+        default=1
+    )
+    parser.add_argument(
+        "--ifm_reg",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=1.0
+    )
+    parser.add_argument(
+        "--sigma_decay",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--sigma_min",
+        type=float,
+        default=0.0001
+    )
+    parser.add_argument(
+        "--sigma_max",
+        type=float,
+        default=0.01
+    )
+    parser.add_argument(
+        "--dropout_p",
+        type=float,
+        default=0.0
+    )
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1
+    )
     return parser.parse_args()
 
 
@@ -342,10 +397,10 @@ def main(args):
     device = torch.device("cuda")
     if args.train_2d:
         config = GPTNeoXConfig(
-            hidden_size=32,
-            intermediate_size=32,
-            num_attention_heads=4,
-            num_hidden_layers=1,
+            hidden_size=args.hdim_2d,
+            intermediate_size=args.idim_2d,
+            num_attention_heads=args.nheads_2d,
+            num_hidden_layers=args.nblocks_2d,
             vocab_size=100,
             use_flash_attention_2=args.use_flash_attention_2
             )
@@ -435,7 +490,7 @@ def main(args):
     # Get current time and initialize wandb
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"cinemaot-{args.model_name}-timepoints{args.time_points}-normout{args.normalize_output}-{args.wandb_run_base_name}-{now}"
+    run_name = f"train2d{args.train_2d}-vae{args.use_vae}-klw{args.kl_weight}-{args.model_name}-timepoints{args.time_points}-straightpath{args.straight_paths}-drop{args.dropout_p}{args.wandb_run_base_name}-{now}"
 
     # configure wandb logging
     if args.wandb_logging and LOCAL_RANK == 0:
@@ -495,6 +550,7 @@ def main(args):
         # deepspeed=args.deepspeed,
         # learning_rate=args.learning_rate,
         # weight_decay=args.weight_decay
+        max_steps=args.max_steps,
     )
 
     if args.train_gaussian:
@@ -516,27 +572,17 @@ def main(args):
         else:
             model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
             if args.use_vae:
-                model.mean_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-                model.var_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-                model.var_activation = vae.module.z_encoder.var_activation
-                model.var_eps = vae.module.z_encoder.var_eps
-                # Assuming 'model.config.hidden_size', 'input_dim', and 'device' are defined
-                model.decoder = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
-                # model.decoder = nn.Sequential(
-                #     nn.Linear(model.config.hidden_size, input_dim),
-                #     nn.LayerNorm(input_dim, elementwise_affine=False),
-                #     nn.ReLU(),
-                #     nn.Dropout(p=0.1),
-                #     nn.Linear(input_dim, input_dim),
-                #     nn.LayerNorm(input_dim, elementwise_affine=False),
-                #     nn.ReLU(),
-                #     nn.Dropout(p=0.1),
-                #     nn.Linear(input_dim, input_dim),
-                #     nn.LayerNorm(input_dim, elementwise_affine=False),
-                #     nn.ReLU(),
-                #     nn.Dropout(p=0.1),
-                #     nn.Linear(input_dim, input_dim)
-                # ).to(device)
+                # model.mean_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
+                # model.var_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
+                # model.var_activation = vae.module.z_encoder.var_activation
+                # model.var_eps = vae.module.z_encoder.var_eps
+                # model.decoder = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
+                model.cell_dec = CustomVAEDecoder(
+                    hidden_size=model.config.hidden_size,
+                    input_dim=input_dim,
+                    device=model.device,
+                    num_blocks=1
+                )
             else:
                 model.cell_dec = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
     else:
@@ -584,7 +630,13 @@ def main(args):
         target_dist=args.target_dist,
         target_dim=args.target_dim,
         just_llm=args.just_llm,
-        train_2d=args.train_2d
+        train_2d=args.train_2d,
+        ifm_reg=args.ifm_reg,
+        kl_weight=args.kl_weight,
+        sigma_decay=args.sigma_decay,
+        sigma_min=args.sigma_min,
+        sigma_max=args.sigma_max,
+        dropout_p=args.dropout_p
     )
 
     resume_from_checkpoint = args.resume_from_checkpoint
