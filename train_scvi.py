@@ -63,47 +63,59 @@ def generate_paths(X_0, X_1, sigma=0.1, time_points=16):
 
 
 def main(args):
-    train_path = "/home/dfl32/project/ifm/cinemaot_data/hvg_normalized_cinemaot.h5ad"
+    train_path = args.adata_path
 
     logger.info("Loading data...")
     adata = sc.read_h5ad(train_path)
 
-    test_combos = combo_split_nochron()
-    adata.obs['cell_type_perturbation'] = list(zip(adata.obs['cell_type'], adata.obs['perturbation']))
-    train_adata = adata[~adata.obs['cell_type_perturbation'].isin(test_combos)].copy()
-    train_adata.obs.drop(columns=['cell_type_perturbation'], inplace=True)
+    if args.raw_data:
+        logger.info("Preprocessing adata...")
+        sc.pp.filter_cells(adata, min_genes=200)
+        sc.pp.filter_genes(adata, min_cells=3)
+        adata = adata[adata.obs.n_genes_by_counts < 2500, :]
+        adata = adata[adata.obs.pct_counts_mt < 5, :].copy()
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
+
+    if args.holdout_perts:
+        test_combos = combo_split_nochron()
+        adata.obs['cell_type_perturbation'] = list(zip(adata.obs['cell_type'], adata.obs['perturbation']))
+        train_adata = adata[~adata.obs['cell_type_perturbation'].isin(test_combos)].copy()
+        train_adata.obs.drop(columns=['cell_type_perturbation'], inplace=True)
+    else:
+        train_adata = adata
 
 
-    if args.paths:
-        all_intermediates = []
-        adata_pert = train_adata[train_adata.obs['perturbation'] != "No stimulation"].copy()
-        adata_ctr = train_adata[train_adata.obs['perturbation'] == "No stimulation"].copy()
-        cell_types = list(train_adata.obs['cell_type'].unique())
-        perturbations = list(train_adata.obs['perturbation'].unique())
-        for cell_type in cell_types:
-            adata_ctr_filtered = adata_ctr[adata_ctr.obs['cell_type'] == cell_type].copy()
-            adata_pert_filtered = adata_pert[adata_pert.obs['cell_type'] == cell_type].copy()
+    # if args.paths:
+    #     all_intermediates = []
+    #     adata_pert = train_adata[train_adata.obs['perturbation'] != "No stimulation"].copy()
+    #     adata_ctr = train_adata[train_adata.obs['perturbation'] == "No stimulation"].copy()
+    #     cell_types = list(train_adata.obs['cell_type'].unique())
+    #     perturbations = list(train_adata.obs['perturbation'].unique())
+    #     for cell_type in cell_types:
+    #         adata_ctr_filtered = adata_ctr[adata_ctr.obs['cell_type'] == cell_type].copy()
+    #         adata_pert_filtered = adata_pert[adata_pert.obs['cell_type'] == cell_type].copy()
 
-            for perturbation in perturbations:
-                # Filter adata_pert for the current perturbation
-                adata_pert_specific = adata_pert_filtered[adata_pert_filtered.obs['perturbation'] == perturbation].copy()
+    #         for perturbation in perturbations:
+    #             # Filter adata_pert for the current perturbation
+    #             adata_pert_specific = adata_pert_filtered[adata_pert_filtered.obs['perturbation'] == perturbation].copy()
                 
-                # Determine the number of samples to match
-                num_samples = adata_pert_specific.shape[0]
+    #             # Determine the number of samples to match
+    #             num_samples = adata_pert_specific.shape[0]
                 
-                # Check if we need to sample with or without replacement
-                if num_samples > adata_ctr_filtered.shape[0]:
-                    # Sample with replacement
-                    sampled_indices = np.random.choice(adata_ctr_filtered.shape[0], num_samples, replace=True)
-                else:
-                    # Sample without replacement
-                    sampled_indices = np.random.choice(adata_ctr_filtered.shape[0], num_samples, replace=False)
+    #             # Check if we need to sample with or without replacement
+    #             if num_samples > adata_ctr_filtered.shape[0]:
+    #                 # Sample with replacement
+    #                 sampled_indices = np.random.choice(adata_ctr_filtered.shape[0], num_samples, replace=True)
+    #             else:
+    #                 # Sample without replacement
+    #                 sampled_indices = np.random.choice(adata_ctr_filtered.shape[0], num_samples, replace=False)
                 
-                # Get the sampled adata_ctr entries
-                adata_ctr_sampled_np = adata_ctr_filtered[sampled_indices, :].X
-                adata_pert_np = adata_pert_specific.X
-                paths = generate_paths(adata_ctr_sampled_np, adata_pert_np)
-                all_intermediates.append(paths[])
+    #             # Get the sampled adata_ctr entries
+    #             adata_ctr_sampled_np = adata_ctr_filtered[sampled_indices, :].X
+    #             adata_pert_np = adata_pert_specific.X
+    #             paths = generate_paths(adata_ctr_sampled_np, adata_pert_np)
+    #             all_intermediates.append(paths[])
 
             
 
@@ -144,6 +156,24 @@ def main(args):
 
 if __name__=="__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--adata_path",
+        type=str,
+        default="/home/dfl32/project/ifm/cinemaot_data/raw_cinemaot.h5ad",
+        help="Path to adata file for training.",
+    )
+    parser.add_argument(
+        "--holdout_perts",
+        type=bool,
+        default=False,
+        help="Hold out test perturbations.",
+    )
+    parser.add_argument(
+        "--raw_data",
+        type=bool,
+        default=True,
+        help="If data is raw counts.",
+    )
     parser.add_argument(
         "--num_epochs",
         type=int,

@@ -70,13 +70,19 @@ class LLMVAETrainer(Trainer):
         target_dist=None,
         target_dim=5000,
         just_llm=False,
-        train_2d=False,
+        train_custom=False,
         ifm_reg=False,
         kl_weight=1.0,
         sigma_decay=False,
         sigma_min=0.0001,
         sigma_max=0.01,
         dropout_p=0.0,
+        scvi_dec=False,
+        time_scale=False,
+        alpha=2,
+        min_weight=0.1,
+        scale_last=False,
+        scale_last_weight=10,
         **args
     ):
         super().__init__(**args)
@@ -91,13 +97,19 @@ class LLMVAETrainer(Trainer):
         self.target_dist = target_dist
         self.target_dim = target_dim
         self.just_llm = just_llm
-        self.train_2d = train_2d
+        self.train_custom = train_custom
         self.ifm_reg = ifm_reg
         self.kl_weight = kl_weight
         self.sigma_decay = sigma_decay
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.dropout_p = dropout_p
+        self.scvi_dec = scvi_dec
+        self.time_scale = time_scale
+        self.alpha = alpha
+        self.min_weight = min_weight
+        self.scale_last = scale_last
+        self.scale_last_weight = scale_last_weight
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -221,8 +233,6 @@ class LLMVAETrainer(Trainer):
             if self.target_dist in ('gaussian', 'checkerboard', 'bimodal'):
                 batch_size = self.args.per_device_train_batch_size
                 target_dim = self.target_dim
-                if self.train_2d:
-                    target_dim = 2
                 if self.target_dist == 'checkerboard':
                     X = self.generate_checkerboard_samples(batch_size).to(model.device)
                 elif self.target_dist == 'bimodal':
@@ -295,7 +305,7 @@ class LLMVAETrainer(Trainer):
 
 
         with self.compute_loss_context_manager():
-            loss = self.compute_loss(model, model_inputs, token_masks, labels)
+            loss = self.compute_loss(model, model_inputs, token_masks, labels, type='train')
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -304,7 +314,7 @@ class LLMVAETrainer(Trainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
-    def compute_loss(self, model, inputs, token_masks, labels, return_outputs=False):
+    def compute_loss(self, model, inputs, token_masks, labels, type, return_outputs=False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
@@ -326,7 +336,10 @@ class LLMVAETrainer(Trainer):
                     #     latent = cond_dist.sample()
                     #     outputs = model.decoder(latent)
                     if self.use_vae:
-                        outputs, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
+                        if self.scvi_dec:
+                            px_scale, px_r, px_rate, px_dropout, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
+                        else:
+                            outputs, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
                     else:
                         outputs = model.cell_dec(outputs.last_hidden_state)
             else:
@@ -352,24 +365,33 @@ class LLMVAETrainer(Trainer):
                 gen_dict = self.generative_dict(inf_dict[MODULE_KEYS.Z_KEY], library, model)
                 return self.vae_loss(x, inf_dict, gen_dict)
             else:
-                outputs_for_loss = outputs[:, :-1, :].contiguous()
-                if self.ifm_reg:
-                    start = labels[:, 0, :]
-                    end = labels[:, -1, :]
-                    reg_weight = (end-start).unsqueeze(1)
-                    reg_weight = reg_weight*0.1
-                labels = labels[:, 1:, :].contiguous()
-                if not self.train_gaussian:
-                    token_masks = token_masks[:, :-1].contiguous().float()
-                    outputs_for_loss = outputs_for_loss * token_masks.unsqueeze(-1)
-
-                reduction = 'mean'
-                if self.train_gaussian and self.use_vae:
-                    reduction = 'none'
-                loss_fn = MSELoss(reduction=reduction)
-                if self.ifm_reg:
-                    outputs_for_loss += outputs_for_loss*reg_weight
-                loss = loss_fn(outputs_for_loss, labels)
+                if self.scvi_dec:
+                    px = ZeroInflatedNegativeBinomial(
+                        mu=px_rate[:,:-1,:],
+                        theta=px_r,
+                        zi_logits=px_dropout[:,:-1,:],
+                        scale=px_scale[:,:-1,:]
+                    )
+                    labels = labels[:, 1:, :].contiguous()
+                    loss = -px.log_prob(labels)
+                else:
+                    outputs_for_loss = outputs[:, :-1, :].contiguous()
+                    if self.ifm_reg:
+                        start = labels[:, 0, :]
+                        end = labels[:, -1, :]
+                        reg_weight = (end-start).unsqueeze(1)
+                        reg_weight = reg_weight*0.1
+                    labels = labels[:, 1:, :].contiguous()
+                    if not self.train_gaussian:
+                        token_masks = token_masks[:, :-1].contiguous().float()
+                        outputs_for_loss = outputs_for_loss * token_masks.unsqueeze(-1)
+                    reduction = 'mean'
+                    if self.train_gaussian and self.use_vae:
+                        reduction = 'none'
+                    loss_fn = MSELoss(reduction=reduction)
+                    if self.ifm_reg:
+                        outputs_for_loss += outputs_for_loss*reg_weight
+                    recon_loss = loss_fn(outputs_for_loss, labels)
 
                 if self.train_gaussian and self.use_vae:
                     pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
@@ -378,7 +400,23 @@ class LLMVAETrainer(Trainer):
                         pz
                     ).sum(dim=-1)[:,:-1]
 
-                    loss = torch.mean(loss.sum(-1) + (kl_divergence_z*self.kl_weight))
+                    recon_loss = recon_loss.sum(-1)
+
+                    loss = recon_loss + (kl_divergence_z*self.kl_weight)
+
+                    if self.time_scale:
+                        loss_weight = (torch.linspace(0, 1, self.time_points-1)**self.alpha) + self.min_weight
+                        loss = loss_weight.to(model.device) * loss
+                    if self.scale_last:
+                        loss[:,-1] *= self.scale_last_weight
+                    loss = torch.mean(loss)
+                    wandb.log(
+                        data={
+                            f"{type}/reconstruction loss": torch.mean(recon_loss),
+                            f"{type}/kl loss": torch.mean(kl_divergence_z)
+                        },
+                        commit=False
+                    )
                 return (loss, outputs) if return_outputs else loss
 
     def prediction_step(
@@ -416,8 +454,6 @@ class LLMVAETrainer(Trainer):
             if self.target_dist in ('gaussian', 'checkerboard', 'bimodal'):
                 batch_size = self.args.per_device_eval_batch_size
                 target_dim = self.target_dim
-                if self.train_2d:
-                    target_dim = 2
                 if self.target_dist == 'checkerboard':
                     X = self.generate_checkerboard_samples(batch_size).to(model.device)
                 elif self.target_dist == 'bimodal':
@@ -491,7 +527,7 @@ class LLMVAETrainer(Trainer):
 
         with torch.no_grad():
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, model_inputs, token_masks, labels)
+                loss = self.compute_loss(model, model_inputs, token_masks, labels, type='eval')
             loss = loss.mean().detach()
 
         return (loss, None, None)
@@ -571,6 +607,8 @@ class LLMVAETrainer(Trainer):
 
     def generate_straight_paths(self, Y, device='cuda', time_points=16):
         X = torch.normal(0.0, 1.0, size=Y.shape).to(device)
+        if self.scvi_dec:
+            X = F.dropout(X, p=0.8, training=True)
         W = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
 
         # Define the time points, evenly spaced from 0 to 1, inclusive

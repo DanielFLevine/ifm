@@ -19,6 +19,6 @@ cd /home/dfl32/project/ifm
 
 python train_scvi.py \
     --num_epochs 100 \
-    --n_layers 3 \
+    --n_layers 2 \
     --n_hidden 128 \
     --n_latent 10

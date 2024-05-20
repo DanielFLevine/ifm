@@ -7,6 +7,7 @@ import random
 from datetime import datetime
 from tqdm import tqdm
 
+from accelerate import Accelerator
 import anndata
 import scanpy as sc
 import scvi
@@ -15,6 +16,7 @@ import wandb
 from datasets import load_from_disk
 from torch import nn
 from torch.distributions import Normal
+import torch.distributed as dist
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils import cpp_extension
 from transformers import (
@@ -31,7 +33,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from utils.combo_split import combo_split_nochron
 from utils.custom_trainer import LLMVAETrainer
-from utils.modules import CustomDecoder, CustomVAEDecoder
+from utils.modules import CustomDecoder, CustomVAEDecoder, CustomSCVIDecoder
+
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -57,7 +61,7 @@ def parse_arguments():
     parser.add_argument(
         "--llm_dataset_path",
         type=str,
-        default="/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/hf_one_ep_ds"
+        default="/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca768_normFalse_hf_ds"
     )
     parser.add_argument(
         "--prompt_path",
@@ -255,7 +259,7 @@ def parse_arguments():
         default=False
     )
     parser.add_argument(
-        "--train_2d",
+        "--train_custom",
         type=bool,
         default=False
     )
@@ -314,6 +318,26 @@ def parse_arguments():
         type=int,
         default=-1
     )
+    parser.add_argument(
+        "--scvi_dec",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--time_scale",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--scale_last",
+        type=bool,
+        default=False
+    )
+    parser.add_argument(
+        "--scale_last_weight",
+        type=int,
+        default=10
+    )
     return parser.parse_args()
 
 
@@ -362,31 +386,31 @@ def main(args):
 
     assert torch.cuda.is_available(), "CUDA unavailable"
     device = torch.device("cuda")
+    if not args.train_gaussian:
+        logger.info("Loading adata...")
+        adata = sc.read_h5ad(args.adata_file_path)
+        logger.info(adata)
 
-    logger.info("Loading adata...")
-    adata = sc.read_h5ad(args.adata_file_path)
-    logger.info(adata)
+        test_combos = combo_split_nochron()
+        adata.obs['cell_type_perturbation'] = list(zip(adata.obs['cell_type'], adata.obs['perturbation']))
+        train_adata = adata[~adata.obs['cell_type_perturbation'].isin(test_combos)].copy()
+        train_adata.obs.drop(columns=['cell_type_perturbation'], inplace=True)
 
-    test_combos = combo_split_nochron()
-    adata.obs['cell_type_perturbation'] = list(zip(adata.obs['cell_type'], adata.obs['perturbation']))
-    train_adata = adata[~adata.obs['cell_type_perturbation'].isin(test_combos)].copy()
-    train_adata.obs.drop(columns=['cell_type_perturbation'], inplace=True)
+        logger.info("Setting up VAE...")
+        scvi.model.SCVI.setup_anndata(train_adata)
+        scvi_model_cp_dir = "/".join(args.scvi_checkpoint.split("/")[:-1])
+        scvi_model_cp_prefix = args.scvi_checkpoint.split("/")[-1][:-8]
+        vae = scvi.model.SCVI.load(scvi_model_cp_dir, adata=train_adata, accelerator='gpu', prefix=scvi_model_cp_prefix)
+        logger.info(vae)
+        logger.info(f"VAE DEVICE: {vae.device}")
 
-    logger.info("Setting up VAE...")
-    scvi.model.SCVI.setup_anndata(train_adata)
-    scvi_model_cp_dir = "/".join(args.scvi_checkpoint.split("/")[:-1])
-    scvi_model_cp_prefix = args.scvi_checkpoint.split("/")[-1][:-8]
-    vae = scvi.model.SCVI.load(scvi_model_cp_dir, adata=train_adata, accelerator='gpu', prefix=scvi_model_cp_prefix)
-    logger.info(vae)
-    logger.info(f"VAE DEVICE: {vae.device}")
-
-    with open(args.prompt_path, "r") as f:
-        prompts = json.load(f)
-    # scvae.train(
-    #     max_epochs=10,
-    #     accelerator='gpu'
-    # )
-    # logger.info(scvae.module)
+        with open(args.prompt_path, "r") as f:
+            prompts = json.load(f)
+        # scvae.train(
+        #     max_epochs=10,
+        #     accelerator='gpu'
+        # )
+        # logger.info(scvae.module)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tokenizer.pad_token is None:
@@ -395,7 +419,7 @@ def main(args):
     # trust_remote_code executes custom code uploaded to the HF hub
     logger.info(f"loading model {args.model_name}")
     device = torch.device("cuda")
-    if args.train_2d:
+    if args.train_custom:
         config = GPTNeoXConfig(
             hidden_size=args.hdim_2d,
             intermediate_size=args.idim_2d,
@@ -415,6 +439,9 @@ def main(args):
             model = AutoModelForCausalLM.from_pretrained(
                 args.checkpoint,
                 use_flash_attention_2=args.use_flash_attention_2).to(device)
+        
+        if isinstance(model, DDP):
+            model = model.module
 
         if (args.max_context_length is not None) and (model.config.max_position_embeddings < args.max_context_length):
             logger.info(f"Max position embeddings increased.")
@@ -490,7 +517,7 @@ def main(args):
     # Get current time and initialize wandb
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"train2d{args.train_2d}-vae{args.use_vae}-klw{args.kl_weight}-{args.model_name}-timepoints{args.time_points}-straightpath{args.straight_paths}-drop{args.dropout_p}{args.wandb_run_base_name}-{now}"
+    run_name = f"traincustom{args.train_custom}-vae{args.use_vae}-klw{args.kl_weight}-{args.model_name}-timepoints{args.time_points}-straightpath{args.straight_paths}-drop{args.dropout_p}{args.wandb_run_base_name}-{now}"
 
     # configure wandb logging
     if args.wandb_logging and LOCAL_RANK == 0:
@@ -557,8 +584,8 @@ def main(args):
         input_dim = len(val_dataset[0]['expr'])
         if args.just_llm:
             model.decoder = nn.Linear(model.config.hidden_size, input_dim)
-        elif args.train_2d:
-            input_dim = 2
+        elif args.train_custom:
+            # input_dim = 2
             model.cell_enc = nn.Linear(input_dim, model.config.hidden_size)
             if args.use_vae:
                 model.cell_dec = CustomVAEDecoder(
@@ -569,6 +596,14 @@ def main(args):
                 )
             else:
                 model.cell_dec = nn.Linear(model.config.hidden_size, input_dim)
+        elif args.scvi_dec:
+            model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
+            model.cell_dec = CustomSCVIDecoder(
+                model.config.hidden_size,
+                input_dim,
+                device,
+                num_blocks=1
+            ).to(device)
         else:
             model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
             if args.use_vae:
@@ -607,6 +642,10 @@ def main(args):
             model.decoder = vae.module.decoder.to(device)
 
     logger.info(model)
+    # logger.info(torch.cuda.device_count())
+    # if torch.cuda.device_count() > 1:
+    #     accelerator = Accelerator()
+    #     model = accelerator.prepare(model)
 
     dc = data_collator
     if args.train_gaussian:
@@ -628,15 +667,19 @@ def main(args):
         use_vae=args.use_vae,
         straight_paths=args.straight_paths,
         target_dist=args.target_dist,
-        target_dim=args.target_dim,
+        target_dim=input_dim,
         just_llm=args.just_llm,
-        train_2d=args.train_2d,
+        train_custom=args.train_custom,
         ifm_reg=args.ifm_reg,
         kl_weight=args.kl_weight,
         sigma_decay=args.sigma_decay,
         sigma_min=args.sigma_min,
         sigma_max=args.sigma_max,
-        dropout_p=args.dropout_p
+        dropout_p=args.dropout_p,
+        scvi_dec=args.scvi_dec,
+        time_scale=args.time_scale,
+        scale_last=args.scale_last,
+        scale_last_weight=args.scale_last_weight
     )
 
     resume_from_checkpoint = args.resume_from_checkpoint
