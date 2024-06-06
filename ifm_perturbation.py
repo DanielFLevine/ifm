@@ -338,6 +338,11 @@ def parse_arguments():
         type=int,
         default=10
     )
+    parser.add_argument(
+        "--space_dim",
+        type=int,
+        default=1
+    )
     return parser.parse_args()
 
 
@@ -468,6 +473,7 @@ def main(args):
 
     dataset = load_from_disk(args.llm_dataset_path)
     if args.train_dataset_size:
+        dataset = dataset.shuffle(seed=42)
         dataset = dataset.select(range(args.train_dataset_size))
 
     if args.train_gaussian:
@@ -580,22 +586,22 @@ def main(args):
         max_steps=args.max_steps,
     )
 
+    logger.info(f"Train Gaussian {True}")
     if args.train_gaussian:
         input_dim = len(val_dataset[0]['expr'])
-        if args.just_llm:
-            model.decoder = nn.Linear(model.config.hidden_size, input_dim)
-        elif args.train_custom:
+        if args.train_custom:
             # input_dim = 2
-            model.cell_enc = nn.Linear(input_dim, model.config.hidden_size)
+            logger.info(f"Cell encoder output dimension: {model.config.hidden_size*args.space_dim}")
+            model.cell_enc = nn.Linear(input_dim, model.config.hidden_size*args.space_dim)
             if args.use_vae:
                 model.cell_dec = CustomVAEDecoder(
-                    hidden_size=model.config.hidden_size,
+                    hidden_size=model.config.hidden_size*args.space_dim,
                     input_dim=input_dim,
                     device=model.device,
                     num_blocks=1
                 )
             else:
-                model.cell_dec = nn.Linear(model.config.hidden_size, input_dim)
+                model.cell_dec = nn.Linear(model.config.hidden_size*args.space_dim, input_dim)
         elif args.scvi_dec:
             model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
             model.cell_dec = CustomSCVIDecoder(
@@ -679,7 +685,8 @@ def main(args):
         scvi_dec=args.scvi_dec,
         time_scale=args.time_scale,
         scale_last=args.scale_last,
-        scale_last_weight=args.scale_last_weight
+        scale_last_weight=args.scale_last_weight,
+        space_dim=args.space_dim
     )
 
     resume_from_checkpoint = args.resume_from_checkpoint
