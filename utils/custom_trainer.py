@@ -83,6 +83,7 @@ class LLMVAETrainer(Trainer):
         min_weight=0.1,
         scale_last=False,
         scale_last_weight=10,
+        space_dim=1,
         **args
     ):
         super().__init__(**args)
@@ -110,6 +111,7 @@ class LLMVAETrainer(Trainer):
         self.min_weight = min_weight
         self.scale_last = scale_last
         self.scale_last_weight = scale_last_weight
+        self.space_dim = space_dim
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -327,7 +329,18 @@ class LLMVAETrainer(Trainer):
                     outputs = model.decoder(outputs)
                 else:
                     outputs = model.cell_enc(inputs)
+                    
+                    # Reshape for spatial integration
+                    batch_size, seq_len, feature = outputs.shape
+                    outputs = outputs.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
+                    outputs = outputs.view(batch_size, seq_len* self.space_dim, feature // self.space_dim)
+
                     outputs = model.gpt_neox(inputs_embeds=outputs)
+
+                    # Reshape to concatenate spatial tokens together
+                    outputs = outputs.last_hidden_state.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
+                    outputs = outputs.view(batch_size, seq_len, feature)
+
                     # if self.use_vae:
                     #     mean = model.mean_encoder(outputs.last_hidden_state)
                     #     var = model.var_encoder(outputs.last_hidden_state)
@@ -337,11 +350,11 @@ class LLMVAETrainer(Trainer):
                     #     outputs = model.decoder(latent)
                     if self.use_vae:
                         if self.scvi_dec:
-                            px_scale, px_r, px_rate, px_dropout, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
+                            px_scale, px_r, px_rate, px_dropout, latents, cond_dist = model.cell_dec(outputs)
                         else:
-                            outputs, latents, cond_dist = model.cell_dec(outputs.last_hidden_state)
+                            outputs, latents, cond_dist = model.cell_dec(outputs)
                     else:
-                        outputs = model.cell_dec(outputs.last_hidden_state)
+                        outputs = model.cell_dec(outputs)
             else:
                 outputs = model.gpt_neox(**inputs)
                 outputs = model.cell_proj_out(outputs.last_hidden_state)
