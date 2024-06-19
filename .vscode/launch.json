@@ -13,16 +13,31 @@
                 "--wandb_logging", "True",
                 "--wandb_run_base_name", "ifm_test",
                 "--model_name", "EleutherAI/pythia-160m",
-                "--llm_dataset_path", "/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_hf_ds",
+                "--llm_dataset_path", "/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca768_normFalse_hf_ds",
                 "--train_gaussian", "True",
+                "--train_custom", "True",
                 "--use_vae", "True",
                 "--logging_steps", "1",
+                "--num_train_epochs", "100",
+                "--time_points", "16",
+                "--max_context_length", "50",
+                "--max_num_blocks", "32",
+                "--per_device_train_batch_size", "128",
+                "--per_device_eval_batch_size", "128",
                 "--eval_steps", "1",
                 "--eval_dataset_size", "50",
                 "--train_dataset_size", "4500",
                 "--time_points", "2",
                 "--normalize_output", "True",
-                "--e2e", "True"
+                "--e2e", "True",
+                "--straight_paths", "True",
+                "--kl_weight", "0.3",
+                "--hdim_2d", "64",
+                "--idim_2d", "64",
+                "--nheads_2d", "4",
+                "--nblocks_2d", "2",
+                "--space_dim", "2",
+                "--save_steps", "100000"
             ]
         }
     ]

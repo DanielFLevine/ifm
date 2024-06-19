@@ -56,23 +56,32 @@ def parse_arguments():
         type=int,
         default=64
     )
+    parser.add_argument(
+        "--space_dim",
+        type=int,
+        default=1
+    )
     return parser.parse_args()
 
 class CustomTransformer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, feedforward_dim, n_heads):
+    def __init__(self, input_dim, hidden_dim, feedforward_dim, n_heads, space_dim=1):
         super(CustomTransformer, self).__init__()
 
         # Embedding layer: 2-layer feedforward network with LayerNorm and Dropout
+        self.space_dim = space_dim
+        self.total_hid_dim = hidden_dim*space_dim
         self.embedding = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(input_dim, self.total_hid_dim),
+            nn.LayerNorm(self.total_hid_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(self.total_hid_dim, self.total_hid_dim),
+            nn.LayerNorm(self.total_hid_dim),
             nn.ReLU(),
             nn.Dropout(0.1)
         )
+
+        self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
         
         # Transformer block configuration
         encoder_layer = TransformerEncoderLayer(
@@ -86,19 +95,32 @@ class CustomTransformer(nn.Module):
         
         # Output MLP with LayerNorm and Dropout
         self.output_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(self.total_hid_dim, self.total_hid_dim),
+            nn.LayerNorm(self.total_hid_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, input_dim),
-            nn.LayerNorm(input_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1)
+            nn.Linear(self.total_hid_dim, input_dim),
+            # nn.LayerNorm(input_dim),
+            # nn.ReLU(),
+            # nn.Dropout(0.1)
         )
         
-    def forward(self, x, mask):
+    def forward(self, x):
         x = self.embedding(x)
         x = x.unsqueeze(1)  # (seq_len, batch_size, feature)
+
+        seq_len, batch_size, feature = x.shape
+        x_reshaped = x.view(seq_len, batch_size, self.space_dim, feature // self.space_dim)
+        x_reshaped = x_reshaped.permute(0, 2, 1, 3).contiguous()
+        x = x_reshaped.view(seq_len * self.space_dim, batch_size, feature // self.space_dim)
+
+        position_indices = torch.arange(x.shape[0], device=x.device).unsqueeze(1).repeat(1, x.shape[1])
+        pos_emb = self.positional_embedding(position_indices)
+        x = x + pos_emb
+
+        seq_len = x.shape[0]
+        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(device)
+
         x = self.transformer_encoder(x, mask=mask)  # Apply causal mask here
         x = x.squeeze(1)
         x = self.output_mlp(x)
@@ -127,7 +149,8 @@ def train_model(args):
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
         feedforward_dim=args.feedforward_dim,
-        n_heads=args.n_heads
+        n_heads=args.n_heads,
+        space_dim=args.space_dim
     ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -148,13 +171,9 @@ def train_model(args):
         # Generate batch
         inputs = generate_batch(args.batch_size, device)
         targets = inputs.clone()  # Assuming the target is to reconstruct the input
-        
-        # Create a square causal mask
-        seq_len = inputs.size(0)
-        mask = torch.triu(torch.ones(seq_len, seq_len) * float('-inf'), diagonal=1).to(device)
 
         # Forward pass
-        outputs = model(inputs, mask)
+        outputs = model(inputs)
         
         # Calculate loss
         loss = criterion(outputs, targets)
