@@ -36,6 +36,20 @@ class MLPLayer(nn.Module):
         out = self.dropout(out)
         return out
 
+class TwoLayerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim, dropout_prob=0.1):
+        super(TwoLayerMLP, self).__init__()
+        self.layer =  MLPLayer(
+            input_dim,
+            output_dim,
+            dropout_prob=dropout_prob
+        )
+        self.linear = nn.Linear(output_dim, output_dim)
+
+    def forward(self, x):
+        out = self.linear(self.layer(x))
+        return out
+
 class MidFC(nn.Module):
     def __init__(self, dim, num_layers, dropout_prob=0.1):
         super(MidFC, self).__init__()
@@ -70,14 +84,20 @@ class CustomDecoder(nn.Module):
         return x
 
 class CustomVAEDecoder(nn.Module):
-    def __init__(self, hidden_size, input_dim, device, num_blocks=1):
+    def __init__(self, hidden_size, input_dim, device, reshape_postvae, space_dim, num_blocks=1):
         super(CustomVAEDecoder, self).__init__()
-        self.mean_encoder = ResidualBlock(hidden_size).to(device)
-        self.var_encoder = ResidualBlock(hidden_size).to(device)
+        self.reshape_postvae = reshape_postvae
+        self.space_dim = space_dim
+        if self.reshape_postvae:
+            gauss_dim = hidden_size
+        else:
+            gauss_dim = hidden_size*space_dim
+        self.mean_encoder = ResidualBlock(gauss_dim).to(device)
+        self.var_encoder = ResidualBlock(gauss_dim).to(device)
         self.var_activation = torch.exp
         self.var_eps = 0.0001
         self.decoder = CustomDecoder(
-            hidden_size=hidden_size,
+            hidden_size=hidden_size*space_dim,
             input_dim=input_dim,
             device=device,
             num_blocks=num_blocks
@@ -90,7 +110,13 @@ class CustomVAEDecoder(nn.Module):
         var = self.var_activation(var) + self.var_eps
         dist = Normal(mu, temperature*(var.sqrt()))
         latents = dist.rsample()
-        outputs = self.decoder(latents)
+        if self.reshape_postvae:
+            batch_size, seq_len, feature_size = latents.shape # now tensor shape is batch_size x num_time_points*space_dim x feature_dim//space_dim
+            latents_reshaped = latents.view(batch_size, seq_len//self.space_dim, self.space_dim, feature_size)
+            latents_reshaped = latents_reshaped.view(batch_size, seq_len//self.space_dim, feature_size*self.space_dim)
+            outputs = self.decoder(latents_reshaped)
+        else:
+            outputs = self.decoder(latents)
         return outputs, latents, dist
 
 

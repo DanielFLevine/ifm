@@ -46,6 +46,16 @@ def parse_arguments():
         default="/home/dfl32/scratch/training-runs"
     )
     parser.add_argument(
+        "--train_dataset_size",
+        type=int,
+        default=None
+    )
+    parser.add_argument(
+        "--eval_dataset_size",
+        type=int,
+        default=1000
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=1000
@@ -79,11 +89,6 @@ def parse_arguments():
         "--wandb_log_steps",
         type=int,
         default=100
-    )
-    parser.add_argument(
-        "--eval_dataset_size",
-        type=int,
-        default=1000
     )
     parser.add_argument(
         "--intermediate_dim",
@@ -133,13 +138,13 @@ class DiffusionMLP(nn.Module):
         return x
 
 class DiffusionFC(nn.Module):
-    def __init__(self, intermediate_dim=1024, num_fc_layers=2, denoising_time_steps=100):
+    def __init__(self, input_dim=768, intermediate_dim=1024, num_fc_layers=2, denoising_time_steps=100):
         super(DiffusionFC, self).__init__()
         self.time_embed = nn.Embedding(denoising_time_steps, intermediate_dim)
         self.model = nn.Sequential(
-            nn.Linear(768, intermediate_dim),
+            nn.Linear(input_dim, intermediate_dim),
             MidFC(dim=intermediate_dim, num_layers=num_fc_layers),
-            nn.Linear(intermediate_dim, 768)
+            nn.Linear(intermediate_dim, input_dim)
         )
     
     def forward(self, x, t):
@@ -205,6 +210,7 @@ def main(args):
     device = torch.device("cuda")
 
     model = DiffusionFC(
+        input_dim=args.input_dim,
         intermediate_dim=args.intermediate_dim,
         num_fc_layers=args.num_fc_layers,
         denoising_time_steps=args.denoising_time_steps
@@ -216,6 +222,9 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters())
 
     dataset = load_from_disk(args.llm_dataset_path)
+    if args.train_dataset_size:
+        dataset = dataset.shuffle(seed=42)
+        dataset = dataset.select(range(args.train_dataset_size))
 
     split_dataset = dataset.train_test_split(
         test_size=0.1, 

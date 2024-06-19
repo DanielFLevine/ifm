@@ -84,6 +84,7 @@ class LLMVAETrainer(Trainer):
         scale_last=False,
         scale_last_weight=10,
         space_dim=1,
+        reshape_postvae=False,
         **args
     ):
         super().__init__(**args)
@@ -112,6 +113,7 @@ class LLMVAETrainer(Trainer):
         self.scale_last = scale_last
         self.scale_last_weight = scale_last_weight
         self.space_dim = space_dim
+        self.reshape_postvae = reshape_postvae
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -335,11 +337,12 @@ class LLMVAETrainer(Trainer):
                     outputs = outputs.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
                     outputs = outputs.view(batch_size, seq_len* self.space_dim, feature // self.space_dim)
 
-                    outputs = model.gpt_neox(inputs_embeds=outputs)
+                    outputs = model.gpt_neox(inputs_embeds=outputs).last_hidden_state
 
                     # Reshape to concatenate spatial tokens together
-                    outputs = outputs.last_hidden_state.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
-                    outputs = outputs.view(batch_size, seq_len, feature)
+                    if not self.reshape_postvae:
+                        outputs = outputs.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
+                        outputs = outputs.view(batch_size, seq_len, feature)
 
                     # if self.use_vae:
                     #     mean = model.mean_encoder(outputs.last_hidden_state)
@@ -408,21 +411,31 @@ class LLMVAETrainer(Trainer):
 
                 if self.train_gaussian and self.use_vae:
                     pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
-                    kl_divergence_z = kl_divergence(
-                        cond_dist,
-                        pz
-                    ).sum(dim=-1)[:,:-1]
+                    if self.reshape_postvae:
+                        kl_divergence_z = kl_divergence(
+                            cond_dist,
+                            pz
+                        ).sum(dim=-1)[:,:-self.space_dim]
+                    else:
+                        kl_divergence_z = kl_divergence(
+                            cond_dist,
+                            pz
+                        ).sum(dim=-1)[:,:-1]
 
-                    recon_loss = recon_loss.sum(-1)
-
-                    loss = recon_loss + (kl_divergence_z*self.kl_weight)
-
-                    if self.time_scale:
-                        loss_weight = (torch.linspace(0, 1, self.time_points-1)**self.alpha) + self.min_weight
-                        loss = loss_weight.to(model.device) * loss
                     if self.scale_last:
+                        recon_loss = recon_loss.sum(-1)
+                        loss = recon_loss + (kl_divergence_z*self.kl_weight)
                         loss[:,-1] *= self.scale_last_weight
-                    loss = torch.mean(loss)
+                        loss = torch.mean(loss)
+                    else:
+                        recon_loss = torch.mean(recon_loss.sum(-1))
+                        kl_loss = torch.mean(kl_divergence_z)
+                        loss = recon_loss + (kl_loss*self.kl_weight)
+
+                    # if self.time_scale:
+                    #     loss_weight = (torch.linspace(0, 1, self.time_points-1)**self.alpha) + self.min_weight
+                    #     loss = loss_weight.to(model.device) * loss
+
                     wandb.log(
                         data={
                             f"{type}/reconstruction loss": torch.mean(recon_loss),

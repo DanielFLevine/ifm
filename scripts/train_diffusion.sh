@@ -27,3 +27,4 @@ python train_diffusion.py \
     --save_steps 5000 \
     --intermediate_dim 2048 \
     --num_fc_layers 2
+    --input_dim 1000

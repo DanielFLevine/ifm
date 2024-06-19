@@ -129,6 +129,11 @@ def parse_arguments():
         type=bool,
         default=False
     )
+    parser.add_argument(
+        "--z_score",
+        type=bool,
+        default=False
+    )
     return parser.parse_args()
 
 def compute_statistics(array1, array2):
@@ -166,6 +171,16 @@ def inverse_transform_gpu(data, pca_model):
     data_inverse = data_inverse_torch.cpu().numpy()  # Move back to CPU and convert to numpy array
     
     return data_inverse
+
+def z_score_norm(matrix):
+    means = np.mean(matrix, axis=0)
+    stds = np.std(matrix, axis=0)
+
+    stds[stds == 0] = 1
+
+    # Perform z-score normalization
+    normalized_matrix = (matrix - means) / stds
+    return normalized_matrix
 
 
 def main(args):
@@ -271,6 +286,11 @@ def main(args):
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
 
+        if args.z_score:
+            logger.info("Normalizing genes by Z-score...")
+            cells_ag = z_score_norm(cells_ag)
+            sampled_expression_data = z_score_norm(sampled_expression_data)
+
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)
         logger.info(f"IFM R^2: {r2}")
@@ -365,6 +385,11 @@ def main(args):
         logger.info("Done.")
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
+
+        if args.z_score:
+            logger.info("Normalizing genes by Z-score...")
+            cells_ag = z_score_norm(cells_ag)
+            sampled_expression_data = z_score_norm(sampled_expression_data)
 
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)
@@ -462,6 +487,11 @@ def main(args):
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
 
+        if args.z_score:
+            logger.info("Normalizing genes by Z-score...")
+            cells_ag = z_score_norm(cells_ag)
+            sampled_expression_data = z_score_norm(sampled_expression_data)
+
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)
         logger.info(f"Diffusion R^2: {r2}")
@@ -541,12 +571,17 @@ def main(args):
             generated_data = model.module.generative(z=z_samples, batch_index=batch_index, library=library_sizes)
             cells = generated_data['px'].sample().cpu().numpy()
 
-        sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
-        sampled_expression_data = expression_data[sample_indices]
+        # sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
+        # sampled_expression_data = expression_data[sample_indices]
 
         cells_ag = cells
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
+
+        if args.z_score:
+            logger.info("Normalizing genes by Z-score...")
+            cells_ag = z_score_norm(cells_ag)
+            sampled_expression_data = z_score_norm(sampled_expression_data)
 
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)

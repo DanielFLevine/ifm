@@ -21,7 +21,7 @@ export TOKENIZERS_PARALLELISM=true
 
 python ifm_perturbation.py \
     --model_name EleutherAI/pythia-160m \
-    --llm_dataset_path /home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca768_normFalse_hf_ds \
+    --llm_dataset_path /home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca1000_hf_ds \
     --train_gaussian True \
     --num_train_epochs 100 \
     --time_points 16 \
@@ -41,4 +41,8 @@ python ifm_perturbation.py \
     --straight_paths True \
     --use_vae True \
     --kl_weight 0.3 \
-    --scale_last True
+    --space_dim 50 \
+    --reshape_postvae True \
+    --mlp_enc True \
+    --use_pretrained True \
+    # --train_dataset_size 5000 \

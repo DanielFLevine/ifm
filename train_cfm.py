@@ -49,6 +49,16 @@ def parse_arguments():
         default="/home/dfl32/scratch/training-runs"
     )
     parser.add_argument(
+        "--train_dataset_size",
+        type=int,
+        default=None
+    )
+    parser.add_argument(
+        "--eval_dataset_size",
+        type=int,
+        default=1000
+    )
+    parser.add_argument(
         "--save_steps",
         type=int,
         default=1000
@@ -82,11 +92,6 @@ def parse_arguments():
         "--wandb_log_steps",
         type=int,
         default=100
-    )
-    parser.add_argument(
-        "--eval_dataset_size",
-        type=int,
-        default=1000
     )
     return parser.parse_args()
 
@@ -225,6 +230,9 @@ def main(args):
     optimizer = torch.optim.Adam(model.parameters())
 
     dataset = load_from_disk(args.llm_dataset_path)
+    if args.train_dataset_size:
+        dataset = dataset.shuffle(seed=42)
+        dataset = dataset.select(range(args.train_dataset_size))
 
     split_dataset = dataset.train_test_split(
         test_size=0.1, 
