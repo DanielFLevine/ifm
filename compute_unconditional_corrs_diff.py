@@ -33,20 +33,20 @@ from torchcfm.conditional_flow_matching import *
 from torchcfm.models.models import *
 from torchcfm.utils import *
 
-from utils.modules import MLPLayer, MidFC, CustomDecoder, CustomVAEDecoder, TwoLayerMLP
+from utils.modules import MLPLayer, MidFC, CustomDecoder, CustomVAEDecoder
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class DiffusionFC(nn.Module):
-    def __init__(self, intermediate_dim=1024, num_fc_layers=2, denoising_time_steps=100):
+    def __init__(self, input_dim=1000, intermediate_dim=1024, num_fc_layers=2, denoising_time_steps=100):
         super(DiffusionFC, self).__init__()
         self.time_embed = nn.Embedding(denoising_time_steps, intermediate_dim)
         self.model = nn.Sequential(
-            nn.Linear(768, intermediate_dim),
+            nn.Linear(input_dim, intermediate_dim),
             MidFC(dim=intermediate_dim, num_layers=num_fc_layers),
-            nn.Linear(intermediate_dim, 768)
+            nn.Linear(intermediate_dim, input_dim)
         )
     
     def forward(self, x, t):
@@ -112,12 +112,17 @@ def parse_arguments():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="pythia-160m-timepoints16-straightpathTrue-drop0.0ifm-2024-06-06_00-39-44"
+        default=None
     )
     parser.add_argument(
         "--num_repeats",
         type=int,
         default=5
+    )
+    parser.add_argument(
+        "--input_dim",
+        type=int,
+        default=1000
     )
     parser.add_argument(
         "--num_samples",
@@ -130,11 +135,6 @@ def parse_arguments():
         default=100
     )
     parser.add_argument(
-        "--temp",
-        type=float,
-        default=1.0
-    )
-    parser.add_argument(
         "--hvgs",
         type=int,
         default=200
@@ -143,51 +143,6 @@ def parse_arguments():
         "--full_cell",
         type=bool,
         default=False
-    )
-    parser.add_argument(
-        "--z_score",
-        type=bool,
-        default=False
-    )
-    parser.add_argument(
-        "--time_points",
-        type=int,
-        default=16
-    )
-    parser.add_argument(
-        "--space_dim",
-        type=int,
-        default=1
-    )
-    parser.add_argument(
-        "--input_dim",
-        type=int,
-        default=1
-    )
-    parser.add_argument(
-        "--reshape_postvae",
-        type=bool,
-        default=False
-    )
-    parser.add_argument(
-        "--mlp_enc",
-        type=bool,
-        default=False
-    )
-    parser.add_argument(
-        "--mlp_musig",
-        type=bool,
-        default=False
-    )
-    parser.add_argument(
-        "--idfm",
-        type=bool,
-        default=False
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=100
     )
     return parser.parse_args()
 
@@ -227,17 +182,6 @@ def inverse_transform_gpu(data, pca_model):
     
     return data_inverse
 
-def z_score_norm(matrix):
-    means = np.mean(matrix, axis=0)
-    stds = np.std(matrix, axis=0)
-
-    stds[stds == 0] = 1
-
-    # Perform z-score normalization
-    normalized_matrix = (matrix - means) / stds
-    return normalized_matrix
-
-
 def main(args):
     # Prep data
 
@@ -266,6 +210,10 @@ def main(args):
     with open(save_path, 'rb') as f:
         pca = pickle.load(f)
 
+    # Load scaler for diffusion
+    with open('/home/dfl32/project/ifm/scalers/train_pcadim1000_minmax.pickle', 'rb') as f:
+        scaler = pickle.load(f)
+
     # Set number of repeats and samples
     num_repeats = args.num_repeats
     num_samples = args.num_samples
@@ -274,150 +222,101 @@ def main(args):
     device = torch.device("cuda")
 
     # Set loop parameters
-    batch_size = args.batch_size
+    batch_size = 100
     num_steps = num_samples//batch_size
 
-    ### IFM ###
-    # Load IFM model
-    cp_dir = args.cp_dir
-    cp_path = os.path.join(cp_dir, args.checkpoint)
+     ### Diffusion ###
+    # Load diffusion model
+    model_path = os.path.join(args.cp_dir, f"checkpoint-{args.checkpoint}.pt")
 
-    config_path = os.path.join(cp_path, "config.json")
-    config = GPTNeoXConfig.from_pretrained(config_path)
 
-    input_dim = args.input_dim
-    # config = GPTNeoXConfig(
-    #         hidden_size=768,
-    #         intermediate_size=1024,
-    #         num_attention_heads=4,
-    #         num_hidden_layers=2,
-    #         vocab_size=100,
-    #         # use_flash_attention_2=args.use_flash_attention_2
-    #         )
-    model = GPTNeoXForCausalLM(config).to(device)
-    if args.mlp_enc:
-        model.cell_enc = TwoLayerMLP(input_dim, model.config.hidden_size*args.space_dim).to(device)
-    else:
-        model.cell_enc = nn.Linear(input_dim, model.config.hidden_size*args.space_dim).to(device)
-    model.cell_dec = CustomVAEDecoder(
-        hidden_size=config.hidden_size,
-        input_dim=input_dim,
-        device=device,
-        reshape_postvae=args.reshape_postvae,
-        space_dim=args.space_dim,
-        num_blocks=1,
-        mlp_enc=args.mlp_musig
-    )
-
-    # cp_dir = "/home/dfl32/scratch/training-runs/"
-    # run_name = "traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-timepoints16-straightpathTrue-drop0.0ifm-2024-05-16_16-12-17"
-    # cp_num = 60000
-    # cp = f"checkpoint-{cp_num}"
-    model_weights_path = os.path.join(cp_path, "model.safetensors")
-    pt_state_dict = safetensors.torch.load_file(model_weights_path, device="cuda")
-    logger.info(model.load_state_dict(pt_state_dict))
+    denoising_time_steps = 1000
+    intermediate_dim = 2048
+    num_fc_layers = 2
+    model = DiffusionFC(
+        input_dim=args.input_dim,
+        intermediate_dim=intermediate_dim,
+        denoising_time_steps=denoising_time_steps,
+        num_fc_layers=num_fc_layers
+    ).to(device)
+    print(model.load_state_dict(torch.load(model_path)))
     model.eval()
+    ddpm = DDPM(model, device, num_timesteps=denoising_time_steps)
 
-    ifm_r2s = []
-    ifm_pears = []
-    ifm_spears = []
-    ifm_r2s_hvg = []
-    ifm_pears_hvg = []
-    ifm_spears_hvg = []
-    ifm_r2s_hvg_rare = []
-    ifm_pears_hvg_rare = []
-    ifm_spears_hvg_rare = []
-    time_points = args.time_points
-    if args.idfm:
-        euler_step_size = 1/(time_points-1)
+
+    diff_r2s = []
+    diff_pears = []
+    diff_spears = []
+    diff_r2s_hvg = []
+    diff_pears_hvg = []
+    diff_spears_hvg = []
+    diff_r2s_hvg_rare = []
+    diff_pears_hvg_rare = []
+    diff_spears_hvg_rare = []
     for _ in range(num_repeats):
+        cells = []
         with torch.no_grad():
-            cells = []
             for step in tqdm(range(num_steps)):
-                inputs = torch.normal(0.0, 1.0, size=(batch_size, 1, input_dim)).to(device)
-                for _ in range(time_points-1):
-                    outputs = model.cell_enc(inputs)
-
-                    # Reshape for spatial integration
-                    batch_size, seq_len, feature = outputs.shape
-                    outputs = outputs.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
-                    outputs = outputs.view(batch_size, seq_len* args.space_dim, feature // args.space_dim)
-
-
-                    outputs = model.gpt_neox(inputs_embeds=outputs).last_hidden_state
-
-                    if not args.reshape_postvae:
-                        outputs = outputs.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
-                        outputs = outputs.view(batch_size, seq_len, feature)
-
-                    outputs, _, _ = model.cell_dec(outputs, temperature=args.temp)
-                    last_outputs = outputs[:, -1:, :]
-                    if args.idfm:
-                        last_outputs = inputs[:, -1:, :] + (euler_step_size * last_outputs)
-                    inputs = torch.concat([inputs, last_outputs], axis=1)
-                cells.append(outputs[:, -1, :].detach().cpu().numpy())
+                x_noisy = torch.randn(batch_size, args.input_dim).to(device)  # Replace with your noisy input
+                x_denoised = ddpm.denoise(x_noisy)
+                x_denoised = scaler.inverse_transform(x_denoised.cpu().numpy())
+                cells.append(x_denoised)
             cells = np.concatenate(cells, axis=0)
-
-        logger.info("Inverse transforming IFM generated cells...")
+        
+        logger.info("Inverse transforming diffusion generated cells...")
         cells_ag = inverse_transform_gpu(cells, pca)
         # cells_ag = pca.inverse_transform(cells)
         logger.info("Done.")
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
-        if args.z_score:
-            logger.info("Normalizing genes by Z-score...")
-            cells_ag = z_score_norm(cells_ag)
-            sampled_expression_data = z_score_norm(sampled_expression_data)
 
-        logger.info("Computing metrics...")
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)
-        logger.info(f"IFM R^2: {r2}")
-        logger.info(f"IFM Pearson correlation: {pearson_corr}")
-        logger.info(f"IFM Spearman correlation: {spearman_corr}")
-        ifm_r2s.append(r2)
-        ifm_pears.append(pearson_corr)
-        ifm_spears.append(spearman_corr)
+        logger.info(f"Diffusion R^2: {r2}")
+        logger.info(f"Diffusion Pearson correlation: {pearson_corr}")
+        logger.info(f"Diffusion Spearman correlation: {spearman_corr}")
+        diff_r2s.append(r2)
+        diff_pears.append(pearson_corr)
+        diff_spears.append(spearman_corr)
 
         # HVGS
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag[:, hvgs], sampled_expression_data[:, hvgs])
-        logger.info(f"IFM HVGS R^2: {r2}")
-        logger.info(f"IFM HVGS Pearson correlation: {pearson_corr}")
-        logger.info(f"IFM HVGS Spearman correlation: {spearman_corr}")
-        ifm_r2s_hvg.append(r2)
-        ifm_pears_hvg.append(pearson_corr)
-        ifm_spears_hvg.append(spearman_corr)
+        logger.info(f"Diffusion HVGS R^2: {r2}")
+        logger.info(f"Diffusion HVGS Pearson correlation: {pearson_corr}")
+        logger.info(f"Diffusion HVGS Spearman correlation: {spearman_corr}")
+        diff_r2s_hvg.append(r2)
+        diff_pears_hvg.append(pearson_corr)
+        diff_spears_hvg.append(spearman_corr)
 
         # Rare HVGS
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag[:, rare_hvgs], sampled_expression_data[:, rare_hvgs])
-        logger.info(f"IFM Rare HVGS R^2: {r2}")
-        logger.info(f"IFM Rare HVGS Pearson correlation: {pearson_corr}")
-        logger.info(f"IFM Rare HVGS Spearman correlation: {spearman_corr}")
-        ifm_r2s_hvg_rare.append(r2)
-        ifm_pears_hvg_rare.append(pearson_corr)
-        ifm_spears_hvg_rare.append(spearman_corr)
+        logger.info(f"Diffusion Rare HVGS R^2: {r2}")
+        logger.info(f"Diffusion Rare HVGS Pearson correlation: {pearson_corr}")
+        logger.info(f"Diffusion Rare HVGS Spearman correlation: {spearman_corr}")
+        diff_r2s_hvg_rare.append(r2)
+        diff_pears_hvg_rare.append(pearson_corr)
+        diff_spears_hvg_rare.append(spearman_corr)
 
-    logger.info(f"\nTemperature {args.temp}")
-    ifm_r2s = np.array(ifm_r2s)
-    ifm_pears = np.array(ifm_pears)
-    ifm_spears = np.array(ifm_spears)
-    logger.info(f"IFM R^2 Mean {ifm_r2s.mean()} STD {ifm_r2s.std()}")
-    logger.info(f"IFM Pearson Mean {ifm_pears.mean()} STD {ifm_pears.std()}")
-    logger.info(f"IFM Spearman Mean {ifm_spears.mean()} STD {ifm_spears.std()}")
+    diff_r2s = np.array(diff_r2s)
+    diff_pears = np.array(diff_pears)
+    diff_spears = np.array(diff_spears)
+    logger.info(f"Diffusion R^2 Mean {diff_r2s.mean()} STD {diff_r2s.std()}")
+    logger.info(f"Diffusion Pearson Mean {diff_pears.mean()} STD {diff_pears.std()}")
+    logger.info(f"Diffusion Spearman Mean {diff_spears.mean()} STD {diff_spears.std()}")
 
-    ifm_r2s_hvg = np.array(ifm_r2s_hvg)
-    ifm_pears_hvg = np.array(ifm_pears_hvg)
-    ifm_spears_hvg = np.array(ifm_spears_hvg)
-    logger.info(f"IFM HVGS R^2 Mean {ifm_r2s_hvg.mean()} STD {ifm_r2s_hvg.std()}")
-    logger.info(f"IFM HVGS Pearson Mean {ifm_pears_hvg.mean()} STD {ifm_pears_hvg.std()}")
-    logger.info(f"IFM HVGS Spearman Mean {ifm_spears_hvg.mean()} STD {ifm_spears_hvg.std()}")
+    diff_r2s_hvg = np.array(diff_r2s_hvg)
+    diff_pears_hvg = np.array(diff_pears_hvg)
+    diff_spears_hvg = np.array(diff_spears_hvg)
+    logger.info(f"Diffusion HVGS R^2 Mean {diff_r2s_hvg.mean()} STD {diff_r2s_hvg.std()}")
+    logger.info(f"Diffusion HVGS Pearson Mean {diff_pears_hvg.mean()} STD {diff_pears_hvg.std()}")
+    logger.info(f"Diffusion HVGS Spearman Mean {diff_spears_hvg.mean()} STD {diff_spears_hvg.std()}")
 
-    ifm_r2s_hvg_rare = np.array(ifm_r2s_hvg_rare)
-    ifm_pears_hvg_rare = np.array(ifm_pears_hvg_rare)
-    ifm_spears_hvg_rare = np.array(ifm_spears_hvg_rare)
-    logger.info(f"IFM Rare HVGS R^2 Mean {ifm_r2s_hvg_rare.mean()} STD {ifm_r2s_hvg_rare.std()}")
-    logger.info(f"IFM Rare HVGS Pearson Mean {ifm_pears_hvg_rare.mean()} STD {ifm_pears_hvg_rare.std()}")
-    logger.info(f"IFM Rare HVGS Spearman Mean {ifm_spears_hvg_rare.mean()} STD {ifm_spears_hvg_rare.std()}")
+    diff_r2s_hvg_rare = np.array(diff_r2s_hvg_rare)
+    diff_pears_hvg_rare = np.array(diff_pears_hvg_rare)
+    diff_spears_hvg_rare = np.array(diff_spears_hvg_rare)
+    logger.info(f"Diffusion Rare HVGS R^2 Mean {diff_r2s_hvg_rare.mean()} STD {diff_r2s_hvg_rare.std()}")
+    logger.info(f"Diffusion Rare HVGS Pearson Mean {diff_pears_hvg_rare.mean()} STD {diff_pears_hvg_rare.std()}")
+    logger.info(f"Diffusion Rare HVGS Spearman Mean {diff_spears_hvg_rare.mean()} STD {diff_spears_hvg_rare.std()}")
 
 if __name__ == "__main__":
     args = parse_arguments()

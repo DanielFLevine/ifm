@@ -525,23 +525,11 @@ def main(args):
         dataset = dataset.shuffle(seed=42)
         dataset = dataset.select(range(args.train_dataset_size))
 
-    if args.train_gaussian:
-        split_dataset = dataset.train_test_split(
-            test_size=0.1, 
-            shuffle=True, 
-            seed=42
-        )
-    else:
-        filtered_dataset = dataset.filter(lambda example: (
-                example['cell_type'],
-                example['perturbation']
-                ) not in test_combos)
-
-        split_dataset = filtered_dataset.train_test_split(
-            test_size=0.1, 
-            shuffle=True, 
-            seed=42
-        )
+    split_dataset = dataset.train_test_split(
+        test_size=0.1, 
+        shuffle=True, 
+        seed=42
+    )
 
     train_dataset = split_dataset['train']
     val_dataset = split_dataset['test']
@@ -549,55 +537,8 @@ def main(args):
     input_dim = len(val_dataset[0]['expr'])
     pca_dim = len(val_dataset[0]['expr'])
 
-    def preprocess_function(examples):
-        # Column names 'pert_expr', 'ctr_expr', 'perturbation', 'cell_type'
-
-        batch_size = len(examples['perturbation'])
-        prefixes = []
-        examples['path'] = []
-        for i in range(batch_size):
-            cell_type = examples['cell_type'][i]
-            perturbation = examples['perturbation'][i]
-            prefix = prompts['prefix'][0].format(cell_type=cell_type, perturbation=perturbation)
-            ctr_expr = examples['ctr_expr'][i]
-            pert_expr = examples['pert_expr'][i]
-            path = generate_paths(ctr_expr, pert_expr, sigma=args.path_var, time_points=args.time_points, straight_paths=args.straight_paths)
-            prefixes.append(prefix)
-            examples['path'].append(path)
-        examples['prefix'] = tokenizer(prefixes, truncation=True, max_length=args.max_context_length)['input_ids']
-        return examples
-    
-    if not args.train_gaussian:
-        train_dataset = train_dataset.map(preprocess_function, batched=True)
-        val_dataset = val_dataset.map(preprocess_function, batched=True)
-
     assert torch.cuda.is_available(), "CUDA unavailable"
     device = torch.device("cuda")
-    if not args.train_gaussian:
-        logger.info("Loading adata...")
-        adata = sc.read_h5ad(args.adata_file_path)
-        logger.info(adata)
-
-        test_combos = combo_split_nochron()
-        adata.obs['cell_type_perturbation'] = list(zip(adata.obs['cell_type'], adata.obs['perturbation']))
-        train_adata = adata[~adata.obs['cell_type_perturbation'].isin(test_combos)].copy()
-        train_adata.obs.drop(columns=['cell_type_perturbation'], inplace=True)
-
-        logger.info("Setting up VAE...")
-        scvi.model.SCVI.setup_anndata(train_adata)
-        scvi_model_cp_dir = "/".join(args.scvi_checkpoint.split("/")[:-1])
-        scvi_model_cp_prefix = args.scvi_checkpoint.split("/")[-1][:-8]
-        vae = scvi.model.SCVI.load(scvi_model_cp_dir, adata=train_adata, accelerator='gpu', prefix=scvi_model_cp_prefix)
-        logger.info(vae)
-        logger.info(f"VAE DEVICE: {vae.device}")
-
-        with open(args.prompt_path, "r") as f:
-            prompts = json.load(f)
-        # scvae.train(
-        #     max_epochs=10,
-        #     accelerator='gpu'
-        # )
-        # logger.info(scvae.module)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tokenizer.pad_token is None:
@@ -616,7 +557,21 @@ def main(args):
             use_flash_attention_2=args.use_flash_attention_2
             )
         model = GPTNeoXForCausalLM(config).to(device)
-        logger.info(model)
+
+        logger.info(f"Cell encoder output dimension: {model.config.hidden_size*args.space_dim}")
+        model.cell_enc = TwoLayerMLP(input_dim, model.config.hidden_size*args.space_dim)
+        if args.use_vae:
+            model.cell_dec = CustomVAEDecoder(
+                hidden_size=model.config.hidden_size,
+                input_dim=input_dim,
+                device=model.device,
+                reshape_postvae=args.reshape_postvae,
+                space_dim=args.space_dim,
+                num_blocks=1,
+                mlp_enc=args.mlp_musig
+            )
+        else:
+            model.cell_dec = nn.Linear(model.config.hidden_size*args.space_dim, input_dim)
 
         if args.use_pretrained:
             pretrained_model_name = "EleutherAI/pythia-160m"
@@ -643,40 +598,8 @@ def main(args):
         pt_state_dict = safetensors.torch.load_file(model_weights_path, device="cuda")
         logger.info(model.load_state_dict(pt_state_dict))
 
-        # if not args.checkpoint:
-        #     model = AutoModelForCausalLM.from_pretrained(
-        #         args.model_name,
-        #         use_flash_attention_2=args.use_flash_attention_2).to(device)
-        # else:
-        #     logger.info(f"Reloading model from checkpoint: {args.checkpoint}")
-        #     model = AutoModelForCausalLM.from_pretrained(
-        #         args.checkpoint,
-        #         use_flash_attention_2=args.use_flash_attention_2).to(device)
-        
-        # if isinstance(model, DDP):
-        #     model = model.module
-
-        # if (args.max_context_length is not None) and (model.config.max_position_embeddings < args.max_context_length):
-        #     logger.info(f"Max position embeddings increased.")
-        #     model.config.max_position_embeddings = args.max_context_length
-        #     # Need to reinstantiate rotary embeddings to adjust for change in context length
-        #     if ("pythia" in args.model_name) and (args.checkpoint is None):
-
-        #         logger.info(f"No checkpoint found, but max position embeddings increased. Reinstantiating rotary positional embeddings.")
-        #         from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXRotaryEmbedding
-
-        #         for i in range(len(model.gpt_neox.layers)):
-        #             dim = model.gpt_neox.layers[i].attention.rotary_emb.dim
-        #             base = model.gpt_neox.layers[i].attention.rotary_emb.base
-
-        #             model.gpt_neox.layers[i].attention.rotary_emb = GPTNeoXRotaryEmbedding(
-        #                 dim=dim,
-        #                 max_position_embeddings=model.config.max_position_embeddings,
-        #                 base=base
-        #             ).to(device)
-
     if args.gradient_checkpointing:
-        logger.info(f"Using gradient checkpointing. Setting use_cache to False.")
+        logger.info("Using gradient checkpointing. Setting use_cache to False.")
         model.config.use_cache = False
 
     # Get current time and initialize wandb
@@ -716,9 +639,6 @@ def main(args):
     train_args = TrainingArguments(
         debug="underflow_overflow",
         output_dir=output_dir,
-        # overwrite_output_dir=args.overwrite_output_dir,
-        # seed=args.seed,
-        # data_seed=args.data_seed,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         evaluation_strategy=args.evaluation_strategy,
@@ -726,11 +646,7 @@ def main(args):
         eval_accumulation_steps=args.eval_accumulation_steps,
         num_train_epochs=args.num_train_epochs,
         report_to="wandb",
-        # torch_compile=args.torch_compile,
-        # torchdynamo=args.torchdynamo,
-        # torch_compile_backend=args.torch_compile_backend,
         fp16=args.fp16,
-        # ddp_backend=args.ddp_backend,
         dataloader_num_workers=args.dataloader_num_workers,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -738,84 +654,9 @@ def main(args):
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        # optim=args.optim,
-        # deepspeed=args.deepspeed,
-        # learning_rate=args.learning_rate,
-        # weight_decay=args.weight_decay
         max_steps=args.max_steps,
     )
-    if args.checkpoint is None:
-        logger.info(f"Train Gaussian {True}")
-        if args.train_gaussian:
-            if args.train_custom:
-                # input_dim = 2
-                logger.info(f"Cell encoder output dimension: {model.config.hidden_size*args.space_dim}")
-                if args.mlp_enc:
-                    model.cell_enc = TwoLayerMLP(input_dim, model.config.hidden_size*args.space_dim)
-                else:
-                    model.cell_enc = nn.Linear(input_dim, model.config.hidden_size*args.space_dim)
-                if args.use_vae:
-                    model.cell_dec = CustomVAEDecoder(
-                        hidden_size=model.config.hidden_size,
-                        input_dim=input_dim,
-                        device=model.device,
-                        reshape_postvae=args.reshape_postvae,
-                        space_dim=args.space_dim,
-                        num_blocks=1,
-                        mlp_enc=args.mlp_musig
-                    )
-                else:
-                    model.cell_dec = nn.Linear(model.config.hidden_size*args.space_dim, input_dim)
-            elif args.scvi_dec:
-                model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
-                model.cell_dec = CustomSCVIDecoder(
-                    model.config.hidden_size,
-                    input_dim,
-                    device,
-                    num_blocks=1
-                ).to(device)
-            else:
-                model.cell_enc = nn.Linear(input_dim, model.config.hidden_size).to(device)
-                if args.use_vae:
-                    # model.mean_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-                    # model.var_encoder = nn.Linear(model.config.hidden_size, model.config.hidden_size).to(device)
-                    # model.var_activation = vae.module.z_encoder.var_activation
-                    # model.var_eps = vae.module.z_encoder.var_eps
-                    # model.decoder = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
-                    model.cell_dec = CustomVAEDecoder(
-                        hidden_size=model.config.hidden_size,
-                        input_dim=input_dim,
-                        device=model.device,
-                        num_blocks=1
-                    )
-                else:
-                    model.cell_dec = CustomDecoder(model.config.hidden_size, input_dim, device).to(device)
-        else:
-            model.cell_enc = vae.module.z_encoder.encoder.to(device)
-            model.cell_proj_in = nn.Linear(model.cell_enc.fc_layers[-1][0].out_features, model.config.hidden_size).to(device)
-            model.cell_proj_out = nn.Linear(model.config.hidden_size, model.cell_enc.fc_layers[-1][0].out_features).to(device)
-            if not args.e2e:
-                for param in model.cell_enc.parameters():
-                    param.requires_grad = False
-            if args.normalize_output:
-                model.output_norm = nn.LayerNorm(model.cell_enc.fc_layers[-1][0].out_features)
-                model.output_relu = nn.ReLU()
-            if args.e2e:
-                model.mean_encoder = vae.module.z_encoder.mean_encoder.to(device)
-                model.var_encoder = vae.module.z_encoder.var_encoder.to(device)
-                model.distribution = vae.module.z_encoder.distribution
-                model.var_eps = vae.module.z_encoder.var_eps
-                model.return_dist = vae.module.z_encoder.return_dist
-                model.z_transformation = vae.module.z_encoder.z_transformation
-                model.var_activation = vae.module.z_encoder.var_activation
-                model.px_r = vae.module.px_r
-                model.decoder = vae.module.decoder.to(device)
-
     logger.info(model)
-    # logger.info(torch.cuda.device_count())
-    # if torch.cuda.device_count() > 1:
-    #     accelerator = Accelerator()
-    #     model = accelerator.prepare(model)
 
     dc = data_collator
     if args.train_gaussian:
@@ -869,8 +710,6 @@ def main(args):
     trainer.log_metrics("train", train_result.metrics)
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
-
-    plot_umap
 
 
 if __name__ == "__main__":

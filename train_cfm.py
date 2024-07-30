@@ -49,6 +49,16 @@ def parse_arguments():
         default="/home/dfl32/scratch/training-runs"
     )
     parser.add_argument(
+        "--model_save_dir",
+        type=str,
+        default=None
+    )
+    parser.add_argument(
+        "--checkpoint_step",
+        type=int,
+        default=None
+    )
+    parser.add_argument(
         "--train_dataset_size",
         type=int,
         default=None
@@ -218,13 +228,21 @@ def main(args):
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
     run_name = f"cfm-mlp-{now}"
+    device = torch.device("cuda")
+
+    model = MLP(dim=args.input_dim, w=args.mlp_width, time_varying=True).to(device)
+    if args.checkpoint_step is not None:
+        checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint-{args.checkpoint_step}.pt")
+        logger.info(f"Loading checkpoint {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        logger.info(model.load_state_dict(checkpoint))
+        run_name = args.model_save_dir.split("/")[-1]
+        logger.info(f"Run name changed to checkpoint model directory: {run_name}")
+    
     wandb.init(
             project="IFM",
             name=run_name,
         )
-    device = torch.device("cuda")
-
-    model = MLP(dim=args.input_dim, w=args.mlp_width, time_varying=True).to(device)
     wandb.watch(model, log="all", log_freq=10)
 
     optimizer = torch.optim.Adam(model.parameters())
@@ -251,8 +269,10 @@ def main(args):
 
     train_dataloader = cycle(DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True))
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
-
-    for step in tqdm(range(args.num_train_steps)):
+    start_step = 0
+    if args.checkpoint_step is not None:
+        start_step = args.checkpoint_step
+    for step in tqdm(range(start_step, start_step + args.num_train_steps)):
         
         optimizer.zero_grad()
 

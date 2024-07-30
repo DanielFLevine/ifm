@@ -84,7 +84,7 @@ class CustomDecoder(nn.Module):
         return x
 
 class CustomVAEDecoder(nn.Module):
-    def __init__(self, hidden_size, input_dim, device, reshape_postvae, space_dim, num_blocks=1):
+    def __init__(self, hidden_size, input_dim, device, reshape_postvae, space_dim, num_blocks=1, mlp_enc=False):
         super(CustomVAEDecoder, self).__init__()
         self.reshape_postvae = reshape_postvae
         self.space_dim = space_dim
@@ -92,8 +92,12 @@ class CustomVAEDecoder(nn.Module):
             gauss_dim = hidden_size
         else:
             gauss_dim = hidden_size*space_dim
-        self.mean_encoder = ResidualBlock(gauss_dim).to(device)
-        self.var_encoder = ResidualBlock(gauss_dim).to(device)
+        if mlp_enc:
+            self.mean_encoder = TwoLayerMLP(gauss_dim, gauss_dim).to(device)
+            self.var_encoder = TwoLayerMLP(gauss_dim, gauss_dim).to(device)
+        else:
+            self.mean_encoder = ResidualBlock(gauss_dim).to(device)
+            self.var_encoder = ResidualBlock(gauss_dim).to(device)
         self.var_activation = torch.exp
         self.var_eps = 0.0001
         self.decoder = CustomDecoder(

@@ -7,6 +7,7 @@ from collections import Counter
 
 import anndata
 import numpy as np
+import torch
 import pandas as pd
 import scanpy as sc
 import scvi
@@ -151,7 +152,7 @@ def main(args):
             max_epochs=1,
             check_val_every_n_epoch=1
         )
-        prefix = f"epoch{epoch}_layers{n_layers}_latent{n_latent}_hidden{n_hidden}_paths{args.paths}"
+        prefix = f"epoch{epoch}_layers{n_layers}_latent{n_latent}_hidden{n_hidden}_calmflow"
         model.save(save_dir, prefix=prefix, overwrite=True)
 
 if __name__=="__main__":
@@ -171,7 +172,7 @@ if __name__=="__main__":
     parser.add_argument(
         "--raw_data",
         type=bool,
-        default=True,
+        default=False,
         help="If data is raw counts.",
     )
     parser.add_argument(

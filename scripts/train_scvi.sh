@@ -18,7 +18,8 @@ conda activate c2s2
 cd /home/dfl32/project/ifm
 
 python train_scvi.py \
+    --adata_path /home/dfl32/project/ifm/cinemaot_data/ifm_adatas/train.h5ad \
     --num_epochs 100 \
     --n_layers 2 \
     --n_hidden 128 \
-    --n_latent 10
+    --n_latent 10 \

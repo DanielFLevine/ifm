@@ -85,6 +85,7 @@ class LLMVAETrainer(Trainer):
         scale_last_weight=10,
         space_dim=1,
         reshape_postvae=False,
+        idfm=False,
         **args
     ):
         super().__init__(**args)
@@ -114,6 +115,7 @@ class LLMVAETrainer(Trainer):
         self.scale_last_weight = scale_last_weight
         self.space_dim = space_dim
         self.reshape_postvae = reshape_postvae
+        self.idfm = idfm
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -246,10 +248,14 @@ class LLMVAETrainer(Trainer):
             else:   
                 X = torch.tensor(inputs['exprs']).to(model.device)
             if self.straight_paths:
-                model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                if self.idfm:
+                    model_inputs, labels = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                else:
+                    model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
             else:
                 model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
-            labels = model_inputs.detach().clone()
+            if not self.idfm:
+                labels = model_inputs.detach().clone()
             token_masks = None
         else:
             input_embeds = []
@@ -489,10 +495,14 @@ class LLMVAETrainer(Trainer):
             else:  
                 X = torch.tensor(inputs['exprs']).to(model.device)
             if self.straight_paths:
-                model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                if self.idfm:
+                    model_inputs, labels = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                else:
+                    model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
             else:
                 model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
-            labels = model_inputs.detach().clone()
+            if not self.idfm:
+                labels = model_inputs.detach().clone()
             token_masks = None
         else:
             input_embeds = []
@@ -645,6 +655,11 @@ class LLMVAETrainer(Trainer):
             W[:, i, :] = (((1 - t) * X) + (t * Y)).to(device)
         
         W = W.to(dtype=torch.float32)
+        if self.idfm:
+            labels = W[:,-1, :] - W[:, 0, :]
+            labels = labels.unsqueeze(1)
+            labels = labels.repeat(1, W.shape[1], 1)
+            return W, labels
         if self.dropout_p > 0.0:
             W = F.dropout(W, p=self.dropout_p, training=True)
         return W

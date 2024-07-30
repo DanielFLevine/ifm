@@ -38,7 +38,7 @@ def parse_arguments():
     parser.add_argument(
         "--llm_dataset_path",
         type=str,
-        default="/home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca768_normFalse_hf_ds"
+        default="/home/dfl32/project/ifm/cinemaot_data/ifm_hf_ds/train_gaussian_pca1000_minmax_hf_ds"
     )
     parser.add_argument(
         "--output_dir",
@@ -202,7 +202,7 @@ def run_eval_loop(ddpm, val_dataloader, device, args):
 def main(args):
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"diffusion-{now}"
+    run_name = f"diffusion-inputdim{args.input_dim}-{now}"
     wandb.init(
             project="IFM",
             name=run_name,

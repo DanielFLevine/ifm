@@ -18,8 +18,8 @@ module load CUDA/12.1
 conda activate c2s2
 cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
-export CP_DIR=/home/dfl32/scratch/training-runs/simple_ifm/cfm-mlp-2024-06-13_10-39-29
-export CHECKPOINT=30000
+export CP_DIR=/home/dfl32/scratch/training-runs/simple_ifm/cfm-mlp-2024-07-09_23-00-13
+export CHECKPOINT=1500000
 
 python compute_unconditional_corrs_cfm.py \
     --cp_dir $CP_DIR \
