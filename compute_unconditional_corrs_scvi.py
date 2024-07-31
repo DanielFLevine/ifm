@@ -1,39 +1,17 @@
 import argparse
-import json
 import logging
-import math
 import os
 import pickle
-import random
-import time
-from datetime import datetime
-from itertools import cycle
-from tqdm import tqdm
 
-import anndata
 import numpy as np
-import pandas as pd
 import scanpy as sc
-import safetensors
 import torch
-import torchdyn
-from datasets import load_from_disk, Dataset
-from matplotlib import pyplot as plt
-from torch import nn
-from torch.utils.data import Dataset, DataLoader, TensorDataset
 from scipy.sparse import issparse
 from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import pairwise
-from sklearn.decomposition import PCA
-from torchdyn.core import NeuralODE
-from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM, GPTNeoXConfig
 
 from scvi.model import SCVI
-from torchcfm.conditional_flow_matching import *
-from torchcfm.models.models import *
-from torchcfm.utils import *
 
-from utils.modules import MLPLayer, MidFC, CustomDecoder, CustomVAEDecoder
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -132,6 +110,13 @@ def main(args):
     num_repeats = args.num_repeats
     num_samples = args.num_samples
 
+    # Load saved PCA model
+    save_dir = "/home/dfl32/project/ifm/projections"
+    save_name = f"pcadim{args.input_dim}_numsamples10000.pickle"
+    save_path = os.path.join(save_dir, save_name)
+    with open(save_path, 'rb') as f:
+        pca = pickle.load(f)
+
 
     ### SCVI ###
     # Load model
@@ -155,6 +140,8 @@ def main(args):
     scvi_r2s_hvg_rare = []
     scvi_pears_hvg_rare = []
     scvi_spears_hvg_rare = []
+    mmds = []
+    wasss = []
     for _ in range(num_repeats):
         cells = []
         with torch.no_grad():
@@ -167,6 +154,17 @@ def main(args):
         cells_ag = cells
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
+
+        logger.info("PCAing ground truth data...")
+        pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
+        logger.info("Done.")
+
+        mmd = mmd_rbf(cells, pca_sampled_expression_data)
+        mmds.append(mmd)
+        logger.info(f"MMD: {mmd}")
+        wass = compute_wass(cells, pca_sampled_expression_data)
+        wasss.append(wass)
+        logger.info(f"Wass: {wass}")
 
 
         # All genes
@@ -200,6 +198,11 @@ def main(args):
     scvi_r2s = np.array(scvi_r2s)
     scvi_pears = np.array(scvi_pears)
     scvi_spears = np.array(scvi_spears)
+    mmds = np.array(mmds)
+    wasss = np.array(wasss)
+    logger.info(f"MMD Mean {mmds.mean()} STD {mmds.std()}")
+    logger.info(f"2-Wasserstein Mean {wasss.mean()} STD {wasss.std()}\n")
+
     logger.info(f"SCVI R^2 Mean {scvi_r2s.mean()} STD {scvi_r2s.std()}")
     logger.info(f"SCVI Pearson Mean {scvi_pears.mean()} STD {scvi_pears.std()}")
     logger.info(f"SCVI Spearman Mean {scvi_spears.mean()} STD {scvi_spears.std()}")

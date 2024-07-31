@@ -1,106 +1,24 @@
 import argparse
-import json
 import logging
-import math
 import os
 import pickle
-import random
-import time
-from datetime import datetime
-from itertools import cycle
 from tqdm import tqdm
 
-import anndata
 import numpy as np
-import pandas as pd
 import scanpy as sc
 import safetensors
 import torch
-import torchdyn
-from datasets import load_from_disk, Dataset
-from matplotlib import pyplot as plt
 from torch import nn
-from torch.utils.data import Dataset, DataLoader, TensorDataset
 from scipy.sparse import issparse
 from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import pairwise
-from sklearn.decomposition import PCA
-from torchdyn.core import NeuralODE
-from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM, GPTNeoXConfig
+from transformers import GPTNeoXForCausalLM, GPTNeoXConfig
 
-from scvi.model import SCVI
-from torchcfm.conditional_flow_matching import *
-from torchcfm.models.models import *
-from torchcfm.utils import *
-
-from utils.modules import MLPLayer, MidFC, CustomDecoder, CustomVAEDecoder, TwoLayerMLP
+from utils.modules import CustomVAEDecoder, TwoLayerMLP
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-class DiffusionFC(nn.Module):
-    def __init__(self, intermediate_dim=1024, num_fc_layers=2, denoising_time_steps=100):
-        super(DiffusionFC, self).__init__()
-        self.time_embed = nn.Embedding(denoising_time_steps, intermediate_dim)
-        self.model = nn.Sequential(
-            nn.Linear(768, intermediate_dim),
-            MidFC(dim=intermediate_dim, num_layers=num_fc_layers),
-            nn.Linear(intermediate_dim, 768)
-        )
-    
-    def forward(self, x, t):
-        t_embed = self.time_embed(t)
-        x = self.model[0](x) + t_embed
-        for layer in self.model[1:]:
-            x = layer(x)
-        return x
-
-
-class DDPM:
-    def __init__(self, model, device, num_timesteps=100, beta_start=0.0001, beta_end=0.02):
-        self.model = model
-        self.device = device
-        self.num_timesteps = num_timesteps
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps).to(device)
-        self.alphas = 1.0 - self.betas
-        self.alpha_bars = torch.cumprod(self.alphas, dim=0).to(device)
-
-    def sample_timesteps(self, batch_size):
-        return torch.randint(0, self.num_timesteps, (batch_size,)).to(self.device)
-
-    def forward_diffusion(self, x_0, t):
-        alpha_bars_t = self.alpha_bars[t].unsqueeze(1)
-        print(alpha_bars_t)
-        noise = torch.randn_like(x_0).to(self.device)
-        x_t = torch.sqrt(alpha_bars_t) * x_0 + torch.sqrt(1 - alpha_bars_t) * noise
-        return x_t, noise
-
-    def denoise_step(self, x, t):
-        alpha_bars_t = self.alpha_bars[t].unsqueeze(1)
-        beta_t = self.betas[t].unsqueeze(1)
-        alpha_t = self.alphas[t].unsqueeze(1)
-        noise = torch.randn_like(x).to(self.device)
-        added_noise = (torch.sqrt(beta_t)*noise)
-        noise_pred = self.model(x, t)
-        noise_pred_coeff = (1-alpha_t)/torch.sqrt(1 - alpha_bars_t)
-        x_prev = (x - noise_pred_coeff * noise_pred) / torch.sqrt(alpha_t)
-        x_prev = x_prev + added_noise
-        return x_prev
-
-    def denoise(self, x):
-        x_t = x
-        for t in range(self.num_timesteps-1, -1, -1):
-            t_tensor = torch.tensor([t], dtype=torch.long).to(x.device)
-            x_t = self.denoise_step(x_t, t_tensor)
-        return x_t
-
-    def loss(self, x_0):
-        batch_size = x_0.shape[0]
-        t = self.sample_timesteps(batch_size).to(x_0.device)
-        x_t, noise = self.forward_diffusion(x_0, t)
-        noise_pred = self.model(x_t, t)
-        return nn.MSELoss()(noise_pred, noise)
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -327,6 +245,8 @@ def main(args):
     ifm_r2s_hvg_rare = []
     ifm_pears_hvg_rare = []
     ifm_spears_hvg_rare = []
+    mmds = []
+    wasss = []
     time_points = args.time_points
     if args.idfm:
         euler_step_size = 1/(time_points-1)
@@ -347,7 +267,7 @@ def main(args):
                     outputs = model.gpt_neox(inputs_embeds=outputs).last_hidden_state
 
                     if not args.reshape_postvae:
-                        outputs = outputs.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
+                        outputs = outputs.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
                         outputs = outputs.view(batch_size, seq_len, feature)
 
                     outputs, _, _ = model.cell_dec(outputs, temperature=args.temp)
@@ -364,6 +284,17 @@ def main(args):
         logger.info("Done.")
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
+        logger.info("PCAing ground truth data...")
+        pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
+        logger.info("Done.")
+
+        mmd = mmd_rbf(cells, pca_sampled_expression_data)
+        mmds.append(mmd)
+        logger.info(f"MMD: {mmd}")
+        wass = compute_wass(cells, pca_sampled_expression_data)
+        wasss.append(wass)
+        logger.info(f"Wass: {wass}")
+
         if args.z_score:
             logger.info("Normalizing genes by Z-score...")
             cells_ag = z_score_norm(cells_ag)
@@ -401,6 +332,11 @@ def main(args):
     ifm_r2s = np.array(ifm_r2s)
     ifm_pears = np.array(ifm_pears)
     ifm_spears = np.array(ifm_spears)
+    mmds = np.array(mmds)
+    wasss = np.array(wasss)
+    logger.info(f"MMD Mean {mmds.mean()} STD {mmds.std()}")
+    logger.info(f"2-Wasserstein Mean {wasss.mean()} STD {wasss.std()}\n")
+
     logger.info(f"IFM R^2 Mean {ifm_r2s.mean()} STD {ifm_r2s.std()}")
     logger.info(f"IFM Pearson Mean {ifm_pears.mean()} STD {ifm_pears.std()}")
     logger.info(f"IFM Spearman Mean {ifm_spears.mean()} STD {ifm_spears.std()}")
