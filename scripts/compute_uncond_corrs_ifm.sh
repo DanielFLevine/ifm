@@ -20,20 +20,24 @@ cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
 export CP_DIR=/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI
 export DATE=2024-07-11_10-33-12
-export SPACE_DIM=20
-export CHECKPOINT=pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space${SPACE_DIM}-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-${DATE}
+export SPACE_DIM=1
+export PREWEIGHTS=True
+export CHECKPOINT=pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space${SPACE_DIM}-postvaeTrue-mlpencTrue-preweights${PREWEIGHTS}-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-${DATE}
 
 python compute_unconditional_corrs_ifm.py \
     --cp_dir $CP_DIR \
     --checkpoint $CHECKPOINT \
     --num_samples 20000 \
     --input_dim 1000 \
-    --temp 0.5 \
+    --temp 1.2 \
     --batch_size 100 \
     --num_repeats 5 \
     --hvgs 50 \
-    --time_points 128 \
+    --time_points 16 \
     --space_dim $SPACE_DIM \
-    --reshape_postvae True \
-    --mlp_enc True \
-    --mlp_musig True \
+    --reshape_postvae \
+    --mlp_enc \
+    --mlp_musig \
+    --mmd_gamma 1.0 \
+    --num_pca_dims 2 \
+    --umap_embed

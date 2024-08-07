@@ -16,7 +16,8 @@ from torchcfm.conditional_flow_matching import *
 from torchcfm.models.models import *
 from torchcfm.utils import *
 
-from utils.metrics import mmd_rbf, compute_wass, transform_gpu
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed
+from utils.plots import plot_umap
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,13 +56,11 @@ def parse_arguments():
     )
     parser.add_argument(
         "--full_cell",
-        type=bool,
-        default=False
+        action="store_true",
     )
     parser.add_argument(
         "--z_score",
-        type=bool,
-        default=False
+        action="store_true",
     )
     parser.add_argument(
         "--input_dim",
@@ -72,6 +71,19 @@ def parse_arguments():
         "--mlp_width",
         type=int,
         default=1024
+    )
+    parser.add_argument(
+        "--num_pca_dims",
+        type=int,
+        default=1000
+    )
+    parser.add_argument(
+        "--plot_umap",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--umap_embed",
+        action="store_true",
     )
     return parser.parse_args()
 
@@ -188,7 +200,7 @@ def main(args):
     mmds = []
     wasss = []
     node = NeuralODE(torch_wrapper(model), solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4)
-    for _ in range(num_repeats):
+    for i in range(num_repeats):
         with torch.no_grad():
             cells = []
             for step in tqdm(range(num_steps)):
@@ -209,11 +221,23 @@ def main(args):
         logger.info("PCAing ground truth data...")
         pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
         logger.info("Done.")
+        
+        if args.plot_umap:
+            if i == 0:
+                logger.info("Plotting UMAP...")
+                plot_umap(
+                    pca_sampled_expression_data,
+                    cells,
+                    plot_name="cfm_umap.png"
+                )
 
-        mmd = mmd_rbf(cells, pca_sampled_expression_data)
+        if args.umap_embed:
+            pca_sampled_expression_data, cells = umap_embed(pca_sampled_expression_data, cells)
+
+        mmd = mmd_rbf(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims])
         mmds.append(mmd)
         logger.info(f"MMD: {mmd}")
-        wass = compute_wass(cells, pca_sampled_expression_data)
+        wass = compute_wass(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims])
         wasss.append(wass)
         logger.info(f"Wass: {wass}")
 

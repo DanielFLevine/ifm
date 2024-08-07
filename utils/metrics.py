@@ -3,7 +3,9 @@ import logging
 import numpy as np
 import ot
 import torch
+import umap
 from sklearn.metrics import pairwise
+from scipy.spatial.distance import cdist
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,6 +27,34 @@ def mmd_rbf(X, Y, gamma=2.0):
     YY = pairwise.rbf_kernel(Y, Y, gamma)
     XY = pairwise.rbf_kernel(X, Y, gamma)
     return XX.mean() + YY.mean() - 2 * XY.mean()
+
+def energy_distance(X, Y):
+    """Compute the Energy Distance between two distributions X and Y.
+
+    Parameters:
+    X : numpy array of shape (n_samples_X, n_features)
+    Y : numpy array of shape (n_samples_Y, n_features)
+
+    Returns:
+    energy_dist : float
+    """
+    # Pairwise distances within X
+    XX_dist = cdist(X, X, metric='euclidean')
+    # Pairwise distances within Y
+    YY_dist = cdist(Y, Y, metric='euclidean')
+    # Pairwise distances between X and Y
+    XY_dist = cdist(X, Y, metric='euclidean')
+    
+    # Compute mean distances
+    XX_mean = XX_dist.mean()
+    YY_mean = YY_dist.mean()
+    XY_mean = XY_dist.mean()
+
+    # Energy distance formula
+    energy_dist = 2 * XY_mean - XX_mean - YY_mean
+    
+    return energy_dist
+
 
 def compute_wass(X, Y, reg=0.01):
     # Compute the cost matrix (squared Euclidean distances)
@@ -57,3 +87,22 @@ def transform_gpu(data, pca):
     
     transformed_data = transformed_data_gpu.cpu().numpy()
     return transformed_data
+
+def umap_embed(
+    gt_data,
+    gen_data,
+):
+    
+    # Combine the two datasets
+    combined_data = np.vstack((gt_data, gen_data))
+
+    # Fit and transform the combined data using UMAP
+    umap_model = umap.UMAP(n_components=2, random_state=42)
+    umap_embedding = umap_model.fit_transform(combined_data)
+
+    # Split the transformed data back into the two original sets
+    num_samples = gt_data.shape[0]
+    umap_gt = umap_embedding[:num_samples]
+    umap_gen = umap_embedding[num_samples:]
+
+    return umap_gt, umap_gen

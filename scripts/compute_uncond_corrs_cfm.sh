@@ -29,3 +29,5 @@ python compute_unconditional_corrs_cfm.py \
     --input_dim 1000 \
     --mlp_width 1024 \
     --hvgs 50 \
+    --num_pca_dims 2 \
+    --umap_embed

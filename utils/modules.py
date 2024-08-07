@@ -50,6 +50,20 @@ class TwoLayerMLP(nn.Module):
         out = self.linear(self.layer(x))
         return out
 
+class TwoLayerDecoder(nn.Module):
+    def __init__(self, input_dim, output_dim, dropout_prob=0.1):
+        super(TwoLayerDecoder, self).__init__()
+        self.layer =  MLPLayer(
+            input_dim,
+            input_dim,
+            dropout_prob=dropout_prob
+        )
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        out = self.linear(self.layer(x))
+        return out
+
 class MidFC(nn.Module):
     def __init__(self, dim, num_layers, dropout_prob=0.1):
         super(MidFC, self).__init__()
