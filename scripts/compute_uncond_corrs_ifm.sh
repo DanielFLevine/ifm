@@ -18,18 +18,16 @@ module load CUDA/12.1
 conda activate c2s2
 cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
-export CP_DIR=/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI
-export DATE=2024-07-11_10-33-12
-export SPACE_DIM=1
-export PREWEIGHTS=True
-export CHECKPOINT=pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space${SPACE_DIM}-postvaeTrue-mlpencTrue-preweights${PREWEIGHTS}-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-${DATE}
+export SPACE_DIM=10
+export TOTAL_SAMPLES=20000
+export POINTS_PER_SAMPLE=1
 
 python compute_unconditional_corrs_ifm.py \
-    --cp_dir $CP_DIR \
-    --checkpoint $CHECKPOINT \
-    --num_samples 20000 \
+    --model_json_path /home/dfl32/project/ifm/models/ifm_paths2.json \
+    --pretrained_weights \
+    --num_samples $(($TOTAL_SAMPLES / $POINTS_PER_SAMPLE)) \
     --input_dim 1000 \
-    --temp 1.2 \
+    --temp 1.4 \
     --batch_size 100 \
     --num_repeats 5 \
     --hvgs 50 \
@@ -39,5 +37,6 @@ python compute_unconditional_corrs_ifm.py \
     --mlp_enc \
     --mlp_musig \
     --mmd_gamma 1.0 \
-    --num_pca_dims 2 \
-    --umap_embed
+    --num_pca_dims 10 \
+    --umap_embed \
+    --points_per_sample $POINTS_PER_SAMPLE

@@ -28,5 +28,5 @@ python compute_unconditional_corrs_diff.py \
     --num_repeats 5 \
     --input_dim 1000 \
     --hvgs 50 \
-    --num_pca_dims 2 \
+    --num_pca_dims 10 \
     --umap_embed

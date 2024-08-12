@@ -86,6 +86,7 @@ class LLMVAETrainer(Trainer):
         space_dim=1,
         reshape_postvae=False,
         idfm=False,
+        points_per_sample=1,
         **args
     ):
         super().__init__(**args)
@@ -116,6 +117,7 @@ class LLMVAETrainer(Trainer):
         self.space_dim = space_dim
         self.reshape_postvae = reshape_postvae
         self.idfm = idfm
+        self.points_per_sample = points_per_sample
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -252,6 +254,7 @@ class LLMVAETrainer(Trainer):
                     model_inputs, labels = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
                 else:
                     model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                    model_inputs = self.multipoint_reshape(model_inputs, self.points_per_sample)
             else:
                 model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
             if not self.idfm:
@@ -358,10 +361,7 @@ class LLMVAETrainer(Trainer):
                     #     latent = cond_dist.sample()
                     #     outputs = model.decoder(latent)
                     if self.use_vae:
-                        if self.scvi_dec:
-                            px_scale, px_r, px_rate, px_dropout, latents, cond_dist = model.cell_dec(outputs)
-                        else:
-                            outputs, latents, cond_dist = model.cell_dec(outputs)
+                        outputs, latents, cond_dist = model.cell_dec(outputs)
                     else:
                         outputs = model.cell_dec(outputs)
             else:
@@ -371,85 +371,60 @@ class LLMVAETrainer(Trainer):
                     outputs = model.output_norm(outputs)
                     outputs = model.output_relu(outputs)
 
-            if (self.e2e) and (not self.train_gaussian):
-                shifted_outputs = outputs[:, :-1, :]
-                token_masks = token_masks[:, :-1]
-                labels = labels[:, 1:, :]
+            # last points_per_sample correspond to final time point, so we ignore those
+            outputs_for_loss = outputs[:, :-self.points_per_sample, :].contiguous()
+            if self.ifm_reg:
+                start = labels[:, 0, :]
+                end = labels[:, -self.points_per_sample, :]
+                reg_weight = (end-start).unsqueeze(1)
+                reg_weight = reg_weight*0.1
+            labels = labels[:, self.points_per_sample:, :].contiguous()
+            if not self.train_gaussian:
+                token_masks = token_masks[:, :-self.points_per_sample].contiguous().float()
+                outputs_for_loss = outputs_for_loss * token_masks.unsqueeze(-1)
+            reduction = 'mean'
+            if self.train_gaussian and self.use_vae:
+                reduction = 'none'
+            loss_fn = MSELoss(reduction=reduction)
+            if self.ifm_reg:
+                outputs_for_loss += outputs_for_loss*reg_weight
+            recon_loss = loss_fn(outputs_for_loss, labels)
 
-                flat_labels = labels.reshape(-1, labels.shape[-1])
-                flat_outputs = shifted_outputs.reshape(-1, shifted_outputs.shape[-1])
-                flat_masks = token_masks.reshape(-1)
-                flat_indices = torch.where(flat_masks)[0]
-                selected_outputs = flat_outputs[flat_indices]
-                x = flat_labels[flat_indices]
-                library = torch.log(x.sum(1)).unsqueeze(1).to(model.device)
-                inf_dict = self.vae_inference_dict(selected_outputs, model, library)
-                gen_dict = self.generative_dict(inf_dict[MODULE_KEYS.Z_KEY], library, model)
-                return self.vae_loss(x, inf_dict, gen_dict)
-            else:
-                if self.scvi_dec:
-                    px = ZeroInflatedNegativeBinomial(
-                        mu=px_rate[:,:-1,:],
-                        theta=px_r,
-                        zi_logits=px_dropout[:,:-1,:],
-                        scale=px_scale[:,:-1,:]
-                    )
-                    labels = labels[:, 1:, :].contiguous()
-                    loss = -px.log_prob(labels)
+            if self.train_gaussian and self.use_vae:
+                pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
+                if self.reshape_postvae:
+                    kl_divergence_z = kl_divergence(
+                        cond_dist,
+                        pz
+                    ).sum(dim=-1)[:,:-self.space_dim*self.points_per_sample]
                 else:
-                    outputs_for_loss = outputs[:, :-1, :].contiguous()
-                    if self.ifm_reg:
-                        start = labels[:, 0, :]
-                        end = labels[:, -1, :]
-                        reg_weight = (end-start).unsqueeze(1)
-                        reg_weight = reg_weight*0.1
-                    labels = labels[:, 1:, :].contiguous()
-                    if not self.train_gaussian:
-                        token_masks = token_masks[:, :-1].contiguous().float()
-                        outputs_for_loss = outputs_for_loss * token_masks.unsqueeze(-1)
-                    reduction = 'mean'
-                    if self.train_gaussian and self.use_vae:
-                        reduction = 'none'
-                    loss_fn = MSELoss(reduction=reduction)
-                    if self.ifm_reg:
-                        outputs_for_loss += outputs_for_loss*reg_weight
-                    recon_loss = loss_fn(outputs_for_loss, labels)
+                    kl_divergence_z = kl_divergence(
+                        cond_dist,
+                        pz
+                    ).sum(dim=-1)[:,:-self.points_per_sample]
 
-                if self.train_gaussian and self.use_vae:
-                    pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
-                    if self.reshape_postvae:
-                        kl_divergence_z = kl_divergence(
-                            cond_dist,
-                            pz
-                        ).sum(dim=-1)[:,:-self.space_dim]
-                    else:
-                        kl_divergence_z = kl_divergence(
-                            cond_dist,
-                            pz
-                        ).sum(dim=-1)[:,:-1]
+                if self.scale_last:
+                    recon_loss = recon_loss.sum(-1)
+                    loss = recon_loss + (kl_divergence_z*self.kl_weight)
+                    loss[:,-1] *= self.scale_last_weight
+                    loss = torch.mean(loss)
+                else:
+                    recon_loss = torch.mean(recon_loss.sum(-1))
+                    kl_loss = torch.mean(kl_divergence_z)
+                    loss = recon_loss + (kl_loss*self.kl_weight)
 
-                    if self.scale_last:
-                        recon_loss = recon_loss.sum(-1)
-                        loss = recon_loss + (kl_divergence_z*self.kl_weight)
-                        loss[:,-1] *= self.scale_last_weight
-                        loss = torch.mean(loss)
-                    else:
-                        recon_loss = torch.mean(recon_loss.sum(-1))
-                        kl_loss = torch.mean(kl_divergence_z)
-                        loss = recon_loss + (kl_loss*self.kl_weight)
+                # if self.time_scale:
+                #     loss_weight = (torch.linspace(0, 1, self.time_points-1)**self.alpha) + self.min_weight
+                #     loss = loss_weight.to(model.device) * loss
 
-                    # if self.time_scale:
-                    #     loss_weight = (torch.linspace(0, 1, self.time_points-1)**self.alpha) + self.min_weight
-                    #     loss = loss_weight.to(model.device) * loss
-
-                    wandb.log(
-                        data={
-                            f"{type}/reconstruction loss": torch.mean(recon_loss),
-                            f"{type}/kl loss": torch.mean(kl_divergence_z)
-                        },
-                        commit=False
-                    )
-                return (loss, outputs) if return_outputs else loss
+                wandb.log(
+                    data={
+                        f"{type}/reconstruction loss": torch.mean(recon_loss),
+                        f"{type}/kl loss": torch.mean(kl_divergence_z)
+                    },
+                    commit=False
+                )
+            return (loss, outputs) if return_outputs else loss
 
     def prediction_step(
         self,
@@ -499,6 +474,7 @@ class LLMVAETrainer(Trainer):
                     model_inputs, labels = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
                 else:
                     model_inputs = self.generate_straight_paths(X, device=model.device, time_points=self.time_points)
+                    model_inputs = self.multipoint_reshape(model_inputs, self.points_per_sample)
             else:
                 model_inputs = self.generate_noise_paths(X, device=model.device, time_points=self.time_points, sigma=self.sigma_min)
             if not self.idfm:
@@ -709,3 +685,14 @@ class LLMVAETrainer(Trainer):
         shuffled_samples = samples[indices]
 
         return shuffled_samples
+
+    def multipoint_reshape(self, X, points_per_sample):
+
+        batch_size, seq_len, feature_dim = X.shape
+
+        new_batch_size = batch_size//points_per_sample
+
+        # Reshape and permute the tensor
+        x_reshaped = X.view(new_batch_size, points_per_sample, seq_len, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, points_per_sample*seq_len, feature_dim)
+        return x_reshaped
+

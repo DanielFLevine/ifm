@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import pickle
@@ -27,6 +28,15 @@ def parse_arguments():
         "--cp_dir",
         type=str,
         default="/home/dfl32/scratch/training-runs/"
+    )
+    parser.add_argument(
+        "--pretrained_weights",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--model_json_path",
+        type=str,
+        default="/home/dfl32/project/ifm/models/ifm_paths.json"
     )
     parser.add_argument(
         "--checkpoint",
@@ -120,7 +130,22 @@ def parse_arguments():
         "--umap_embed",
         action="store_true",
     )
+    parser.add_argument(
+        "--points_per_sample",
+        type=int,
+        default=1
+    )
     return parser.parse_args()
+
+def multipoint_reshape(X, points_per_sample):
+
+    batch_size, seq_len, feature_dim = X.shape
+
+    new_batch_size = batch_size//points_per_sample
+
+    # Reshape and permute the tensor
+    x_reshaped = X.view(new_batch_size, points_per_sample, seq_len, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, points_per_sample*seq_len, feature_dim)
+    return x_reshaped
 
 def compute_statistics(array1, array2):
     # Ensure the arrays have the same shape
@@ -210,21 +235,19 @@ def main(args):
 
     ### IFM ###
     # Load IFM model
-    cp_dir = args.cp_dir
-    cp_path = os.path.join(cp_dir, args.checkpoint)
+    with open(args.model_json_path, "r") as f:
+        model_paths = json.load(f)
+    
+    weights = "pretrained_weights" if args.pretrained_weights else "random_weights"
+    cp_path = model_paths[weights][str(args.space_dim)]
+    logger.info(f"CHECKPOINT PATH: {cp_path}")
+    if args.space_dim == 640:
+        args.space_dim = 1
 
     config_path = os.path.join(cp_path, "config.json")
     config = GPTNeoXConfig.from_pretrained(config_path)
 
     input_dim = args.input_dim
-    # config = GPTNeoXConfig(
-    #         hidden_size=768,
-    #         intermediate_size=1024,
-    #         num_attention_heads=4,
-    #         num_hidden_layers=2,
-    #         vocab_size=100,
-    #         # use_flash_attention_2=args.use_flash_attention_2
-    #         )
     model = GPTNeoXForCausalLM(config).to(device)
     if args.mlp_enc:
         model.cell_enc = TwoLayerMLP(input_dim, model.config.hidden_size*args.space_dim).to(device)
@@ -240,10 +263,7 @@ def main(args):
         mlp_enc=args.mlp_musig
     )
 
-    # cp_dir = "/home/dfl32/scratch/training-runs/"
-    # run_name = "traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-timepoints16-straightpathTrue-drop0.0ifm-2024-05-16_16-12-17"
-    # cp_num = 60000
-    # cp = f"checkpoint-{cp_num}"
+
     model_weights_path = os.path.join(cp_path, "model.safetensors")
     pt_state_dict = safetensors.torch.load_file(model_weights_path, device="cuda")
     logger.info(model.load_state_dict(pt_state_dict))
@@ -267,7 +287,7 @@ def main(args):
         with torch.no_grad():
             cells = []
             for step in tqdm(range(num_steps)):
-                inputs = torch.normal(0.0, 1.0, size=(batch_size, 1, input_dim)).to(device)
+                inputs = torch.normal(0.0, 1.0, size=(batch_size, args.points_per_sample, input_dim)).to(device)
                 for _ in range(time_points-1):
                     outputs = model.cell_enc(inputs)
 
@@ -284,18 +304,19 @@ def main(args):
                         outputs = outputs.view(batch_size, seq_len, feature)
 
                     outputs, _, _ = model.cell_dec(outputs, temperature=args.temp)
-                    last_outputs = outputs[:, -1:, :]
+                    last_outputs = outputs[:, -args.points_per_sample:, :]
                     if args.idfm:
-                        last_outputs = inputs[:, -1:, :] + (euler_step_size * last_outputs)
+                        last_outputs = inputs[:, -args.points_per_sample:, :] + (euler_step_size * last_outputs)
                     inputs = torch.concat([inputs, last_outputs], axis=1)
-                cells.append(outputs[:, -1, :].detach().cpu().numpy())
+                batch_size, _, feature_dim = outputs.shape
+                cells.append(outputs[:, -args.points_per_sample:, :].reshape(args.points_per_sample*batch_size, feature_dim).detach().cpu().numpy())
             cells = np.concatenate(cells, axis=0)
 
         logger.info("Inverse transforming IFM generated cells...")
         cells_ag = inverse_transform_gpu(cells, pca)
         # cells_ag = pca.inverse_transform(cells)
         logger.info("Done.")
-        sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
+        sample_indices = np.random.choice(expression_data.shape[0], size=num_samples*args.points_per_sample, replace=False)
         sampled_expression_data = expression_data[sample_indices]
         logger.info("PCAing ground truth data...")
         pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
@@ -307,7 +328,7 @@ def main(args):
                 plot_umap(
                     pca_sampled_expression_data,
                     cells,
-                    plot_name="calmflow_umap.png"
+                    plot_name=f"calmflow_pp4_space{args.space_dim}_umap.png"
                 )
 
         if args.umap_embed:

@@ -11,7 +11,7 @@ from scipy.stats import pearsonr, spearmanr
 
 from scvi.model import SCVI
 
-from utils.metrics import mmd_rbf, compute_wass, transform_gpu
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,6 +22,11 @@ def parse_arguments():
         "--num_repeats",
         type=int,
         default=5
+    )
+    parser.add_argument(
+        "--input_dim",
+        type=int,
+        default=1000
     )
     parser.add_argument(
         "--num_samples",
@@ -37,6 +42,19 @@ def parse_arguments():
         "--hvgs",
         type=int,
         default=200
+    )
+    parser.add_argument(
+        "--num_pca_dims",
+        type=int,
+        default=1000
+    )
+    parser.add_argument(
+        "--plot_umap",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--umap_embed",
+        action="store_true",
     )
     return parser.parse_args()
 
@@ -152,6 +170,7 @@ def main(args):
             cells = generated_data['px'].sample().cpu().numpy()
 
         cells_ag = cells
+        cells = transform_gpu(cells, pca)
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
 
@@ -159,10 +178,13 @@ def main(args):
         pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
         logger.info("Done.")
 
-        mmd = mmd_rbf(cells, pca_sampled_expression_data)
+        if args.umap_embed:
+            pca_sampled_expression_data, cells = umap_embed(pca_sampled_expression_data, cells)
+
+        mmd = mmd_rbf(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims])
         mmds.append(mmd)
         logger.info(f"MMD: {mmd}")
-        wass = compute_wass(cells, pca_sampled_expression_data)
+        wass = compute_wass(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims])
         wasss.append(wass)
         logger.info(f"Wass: {wass}")
 

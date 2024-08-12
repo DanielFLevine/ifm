@@ -1,43 +1,26 @@
 import argparse
-import json
 import logging
 import os
-import pickle
-import random
 from datetime import datetime
 from tqdm import tqdm
 
-from accelerate import Accelerator
-import anndata
 import numpy as np
 import safetensors
-import scanpy as sc
-import scvi
 import torch
-import wandb
 from datasets import load_from_disk
 from torch import nn
-from torch.distributions import Normal
-import torch.distributed as dist
-from peft import LoraConfig, TaskType, get_peft_model
 from torch.utils import cpp_extension
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    HfArgumentParser,
-    EarlyStoppingCallback,
     TrainingArguments,
     GPTNeoXForCausalLM,
     GPTNeoXConfig
 )
-from optimum.bettertransformer import BetterTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from utils.combo_split import combo_split_nochron
 from utils.custom_trainer import LLMVAETrainer
-from utils.modules import CustomDecoder, CustomVAEDecoder, CustomSCVIDecoder, TwoLayerMLP
+from utils.modules import CustomVAEDecoder, TwoLayerMLP
 
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 import umap
 import matplotlib.pyplot as plt
@@ -90,8 +73,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--resume_from_checkpoint",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--scvi_checkpoint",
@@ -120,13 +102,11 @@ def parse_arguments():
     )
     parser.add_argument(
         "--use_flash_attention_2",
-        type=bool,
-        default=True
+        action="store_false"
     )
     parser.add_argument(
         "--gradient_checkpointing",
-        type=bool,
-        default=True
+        action="store_false"
     )
     parser.add_argument(
         "--train_dataset_size",
@@ -145,8 +125,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--wandb_logging",
-        type=bool,
-        default=True
+        action="store_false"
     )
     parser.add_argument(
         "--wandb_run_base_name",
@@ -185,8 +164,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--fp16",
-        type=bool,
-        default=True
+        action="store_false"
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -220,33 +198,27 @@ def parse_arguments():
     )
     parser.add_argument(
         "--normalize_output",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--e2e",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--train_gaussian",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--use_vae",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--straight_paths",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--skip_conn_dec",
-        type=bool,
-        default=True
+        action="store_false"
     )
     parser.add_argument(
         "--target_dist",
@@ -260,13 +232,11 @@ def parse_arguments():
     )
     parser.add_argument(
         "--just_llm",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--train_custom",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--hdim_2d",
@@ -290,8 +260,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--ifm_reg",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--kl_weight",
@@ -300,8 +269,7 @@ def parse_arguments():
     )
     parser.add_argument(
         "--sigma_decay",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--sigma_min",
@@ -325,18 +293,15 @@ def parse_arguments():
     )
     parser.add_argument(
         "--scvi_dec",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--time_scale",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--scale_last",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--scale_last_weight",
@@ -350,28 +315,28 @@ def parse_arguments():
     )
     parser.add_argument(
         "--reshape_postvae",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--mlp_enc",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--use_pretrained",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--idfm",
-        type=bool,
-        default=False
+        action="store_true"
     )
     parser.add_argument(
         "--mlp_musig",
-        type=bool,
-        default=False
+        action="store_true"
+    )
+    parser.add_argument(
+        "--points_per_sample",
+        type=int,
+        default=1
     )
     return parser.parse_args()
 
@@ -605,7 +570,7 @@ def main(args):
     # Get current time and initialize wandb
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"traincustom{args.train_custom}-vae{args.use_vae}-klw{args.kl_weight}-{args.model_name}-idfm{args.idfm}-hdim_2d{args.hdim_2d}idim_2d{args.idim_2d}nheads_2d{args.nheads_2d}nblocks_2d{args.nblocks_2d}-space{args.space_dim}-postvae{args.reshape_postvae}-mlpenc{args.mlp_enc}-preweights{args.use_pretrained}-pca{pca_dim}-datasize{args.train_dataset_size}-timepoints{args.time_points}-straightpath{args.straight_paths}-drop{args.dropout_p}{args.wandb_run_base_name}-{now}"
+    run_name = f"traincustom{args.train_custom}-vae{args.use_vae}-klw{args.kl_weight}-{args.model_name}-idfm{args.idfm}-hdim{args.hdim_2d}idim{args.idim_2d}nheads{args.nheads_2d}nblocks{args.nblocks_2d}-space{args.space_dim}-pps{args.points_per_sample}-preweights{args.use_pretrained}-pca{pca_dim}-timepoints{args.time_points}-straightpath{args.straight_paths}-drop{args.dropout_p}{args.wandb_run_base_name}-{now}"
 
     # configure wandb logging
     if args.wandb_logging and LOCAL_RANK == 0:
@@ -693,7 +658,8 @@ def main(args):
         scale_last_weight=args.scale_last_weight,
         space_dim=args.space_dim,
         reshape_postvae=args.reshape_postvae,
-        idfm=args.idfm
+        idfm=args.idfm,
+        points_per_sample=args.points_per_sample
     )
 
     resume_from_checkpoint = args.resume_from_checkpoint
