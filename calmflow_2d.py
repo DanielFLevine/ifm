@@ -11,30 +11,47 @@ import umap
 import wandb
 import matplotlib.pyplot as plt
 from torch import nn
+from torch.nn import MSELoss
 from torch.nn.functional import mse_loss, normalize
+from torch.distributions import Normal, kl_divergence
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
 from utils.toy_datasets import IFMdatasets
-from utils.modules import TwoLayerMLP, TwoLayerDecoder
+from utils.modules import CustomVAEDecoder, TwoLayerMLP, TwoLayerDecoder
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class IDFMModel(nn.Module):
+class CaLMFlowModel(nn.Module):
 
-    def __init__(self, encoder, transformer, decoder):
+    def __init__(self, encoder, transformer, decoder, use_vae=True):
         super().__init__()
         self.encoder = encoder
         self.transformer = transformer
         self.decoder = decoder
+        self.use_vae = use_vae
 
-    def forward(self, inputs, output_attentions=False):
+    def forward(self, inputs, output_attentions=False, temp=1.0, pps=1):
         embs = self.encoder(inputs)
         hid_states = self.transformer.gpt_neox(inputs_embeds=embs, output_attentions=output_attentions)
-        outputs = self.decoder(hid_states.last_hidden_state+embs)
+        if self.use_vae:
+            outputs, latents, cond_dist = self.decoder(hid_states.last_hidden_state)
+            return outputs, latents, cond_dist
+        else:
+            outputs = self.decoder(hid_states.last_hidden_state+embs, temperature=temp)
         if output_attentions:
             return outputs, hid_states.attentions, hid_states.last_hidden_state
         return outputs, None, None
+
+    def multipoint_reshape(self, X, points_per_sample):
+
+        batch_size, seq_len, feature_dim = X.shape
+
+        new_batch_size = batch_size//points_per_sample
+
+        # Reshape and permute the tensor
+        x_reshaped = X.view(new_batch_size, points_per_sample, seq_len, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, points_per_sample*seq_len, feature_dim)
+        return x_reshaped
 
 class torch_wrapper(nn.Module):
     """Wraps model to torchdyn compatible format."""
@@ -188,9 +205,64 @@ def parse_arguments():
         action="store_true",
         help="Use linear variance schedule for VE paths"
     )
+    parser.add_argument(
+        "--use_vae",
+        action="store_true",
+        help="Use VAE decoder"
+    )
+    parser.add_argument(
+        "--mlp_musig",
+        action="store_true",
+        help="Use mlps to project hidden state to mean and variance"
+    )
+    parser.add_argument(
+        "--pps",
+        type=int,
+        default=1,
+        help="Number of trajectories per sample (not compatible with idfm; set to 1 for idfm)"
+    )
+    parser.add_argument(
+        "--kl_weight",
+        type=float,
+        default=1.0,
+        help="Weight for KL divergence regularizer in loss function"
+    )
+    parser.add_argument(
+        "--space_dim",
+        type=int,
+        default=1,
+        help="Number of tokens per time point"
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=1.0,
+        help="Temperature for inference with VAE"
+    )
     return parser.parse_args()
 
-def generate_straight_paths(X, Y, device='cuda', time_points=16, path_sigma=0.0):
+def multipoint_reshape(X, points_per_sample):
+
+    batch_size, seq_len, feature_dim = X.shape
+
+    new_batch_size = batch_size//points_per_sample
+
+    # Reshape and permute the tensor
+    x_reshaped = X.view(new_batch_size, points_per_sample, seq_len, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, points_per_sample*seq_len, feature_dim)
+    return x_reshaped
+
+def unipoint_reshape(X, points_per_sample):
+
+    batch_size, seq_len, feature_dim = X.shape
+
+    new_batch_size = batch_size*points_per_sample
+
+    # Reshape and permute the tensor
+    x_reshaped = X.reshape(batch_size, seq_len//points_per_sample, points_per_sample, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, seq_len//points_per_sample, feature_dim)
+
+    return x_reshaped
+    
+def generate_straight_paths(X, Y, device='cuda', time_points=16, path_sigma=0.0, idfm=False):
     W = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
 
     # Define the time points, evenly spaced from 0 to 1, inclusive
@@ -209,10 +281,14 @@ def generate_straight_paths(X, Y, device='cuda', time_points=16, path_sigma=0.0)
             W[:, i, :] = (((1 - t) * X) + (t * Y)).to(device)
     
     W = W.to(dtype=torch.float32)
-    labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
+    if idfm:
+        labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
+        return W, labels
+    
+    labels = W.detach().clone()
     return W, labels
 
-def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma_max=1e1, use_last=False, linear_sched=False):
+def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma_max=1e1, use_last=False, linear_sched=False, idfm=False):
     sigma_min = torch.tensor(sigma_min)
     sigma_max = torch.tensor(sigma_max)
 
@@ -221,7 +297,8 @@ def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma
     # Define the time points, evenly spaced from 0 to 1, inclusive
     times = torch.linspace(0, 1, time_points).to(device)
 
-    labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
+    if idfm:
+        labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
 
     cur_start = X
     # Loop over each time point
@@ -242,15 +319,34 @@ def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma
             cur_start = W[:, i, :]
             labels[:, i, :] = Y - cur_start
 
-        log_term = torch.log(sigma_max / sigma_min)
-        derivative = -sigma_max * log_term * (sigma_max / sigma_min) ** (-t)
+        # log_term = torch.log(sigma_max / sigma_min)
+        # derivative = -sigma_max * log_term * (sigma_max / sigma_min) ** (-t)
         
-        # Divide the derivative by the original variance
-        ve_scale = derivative / variance
-
-        labels[:, i, :] = labels[:, i, :]
-
+        # # Divide the derivative by the original variance
+        # ve_scale = derivative / variance
+        if idfm:
+            labels[:, i, :] = labels[:, i, :]
+    
+    if not idfm:
+        labels = W.detach().clone()
     return W, labels
+
+def generate_ifm(model, inputs, time_points=16, space_dim=1, temp=1.0, pps=1, continuous_time=False, device='cuda', output_attentions=False):
+    for _ in range(time_points-1):
+        outputs = model.encoder(inputs)
+
+        # Reshape for spatial integration
+        batch_size, seq_len, feature = outputs.shape
+        outputs = outputs.view(batch_size, seq_len, space_dim, feature // space_dim)
+        outputs = outputs.view(batch_size, seq_len * space_dim, feature // space_dim)
+
+
+        outputs = model.transformer.gpt_neox(inputs_embeds=outputs).last_hidden_state
+
+        outputs, _, _ = model.decoder(outputs, temperature=temp)
+        last_outputs = outputs[:, -pps:, :]
+        inputs = torch.concat([inputs, last_outputs], axis=1)
+    return inputs
 
 def generate_idfm(model, inputs, batch_size, time_points=16, continuous_time=False, device='cuda', output_attentions=False):
     """Generate using Eulers method
@@ -451,7 +547,7 @@ def orthogonality_regularizer(hidden_states):
 def main(args):
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"idfm-2moons-{args.timepoints}-{now}"
+    run_name = f"idfm-2moons-tp{args.timepoints}-pps{args.pps}-temp{args.temp}-{now}"
     device = torch.device("cuda")
 
     eight_gaussian_dataset = IFMdatasets(batch_size = args.batch_size, dataset_name="8gaussians", dim=2, gaussian_var=0.1)
@@ -473,13 +569,25 @@ def main(args):
         input_dim=input_dim,
         output_dim=args.hdim
     ).to(device)
-    decoder = TwoLayerDecoder(args.hdim, 2).to(device)
+    if args.use_vae:
+        decoder = CustomVAEDecoder(
+            hidden_size=config.hidden_size,
+            input_dim=input_dim,
+            device=device,
+            reshape_postvae=True,
+            space_dim=args.space_dim,
+            num_blocks=1,
+            mlp_enc=args.mlp_musig
+        )
+    else:
+        decoder = TwoLayerDecoder(args.hdim, 2).to(device)
     # decoder = nn.Linear(args.hdim, 2).to(device)
 
-    model = IDFMModel(
+    model = CaLMFlowModel(
         encoder,
         transformer,
-        decoder
+        decoder,
+        use_vae=args.use_vae
     )
 
     wandb.init(
@@ -504,23 +612,41 @@ def main(args):
                 sigma_min=args.sigma_min,
                 sigma_max=args.sigma_max,
                 use_last=args.use_last,
-                linear_sched=args.linear_sched
+                linear_sched=args.linear_sched,
+                idfm=args.idfm
             )
         else: 
             model_inputs, labels = generate_straight_paths(
                 x0,
                 x1,
                 time_points=args.timepoints,
-                path_sigma=args.path_sigma
+                path_sigma=args.path_sigma,
+                idfm=args.idfm
             )
 
         if args.continuous_time:
             model_inputs = concat_time(model_inputs, args.batch_size, args.timepoints, device)
-        outputs, _, last_hidden_states = model(model_inputs, output_attentions=args.orth_reg)
-        pred = outputs[:, :-1, :]
-        gt = labels[:,1:,:]
-
-        loss = mse_loss(pred, gt, reduction="none").sum(dim=-1).mean()
+        if not args.idfm:
+            model_inputs = multipoint_reshape(model_inputs, args.pps)
+            labels = multipoint_reshape(labels, args.pps)
+            outputs, latents, cond_dist = model(model_inputs, output_attentions=args.orth_reg)
+            pred = outputs[:, :-args.pps, :].contiguous()
+            gt = labels[:,args.pps:,:]
+            loss_fn = MSELoss(reduction='none')
+            recon_loss = loss_fn(pred, gt)
+            pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
+            kl_divergence_z = kl_divergence(
+                cond_dist,
+                pz
+            ).sum(dim=-1)[:,:-args.space_dim*args.pps]
+            recon_loss = torch.mean(recon_loss.sum(-1))
+            kl_loss = torch.mean(kl_divergence_z)
+            loss = recon_loss + (kl_loss*args.kl_weight)
+        else:
+            outputs, _, last_hidden_states = model(model_inputs, output_attentions=args.orth_reg)
+            pred = outputs[:, :-args.pps, :].contiguous()
+            gt = labels[:,args.pps:,:]
+            loss = mse_loss(pred, gt, reduction="none").sum(dim=-1).mean()
 
         if args.orth_reg:
             orth_reg = orthogonality_regularizer(last_hidden_states)
@@ -538,26 +664,31 @@ def main(args):
                 all_trajs = []
                 for step in range(num_inf_steps):
                     x0 = samples[step*args.inf_batch_size:(step+1)*args.inf_batch_size]
-                    if args.use_rk:
-                        if args.ada:
-                            inf_traj = generate_idfm_2_ada(model, x0, time_points=args.timepoints, tol=args.tol, min_dt=args.min_dt)
+                    if args.idfm:
+                        if args.use_rk:
+                            if args.ada:
+                                inf_traj = generate_idfm_2_ada(model, x0, time_points=args.timepoints, tol=args.tol, min_dt=args.min_dt)
+                            else:
+                                inf_traj = generate_idfm_2(model, x0, time_points=args.timepoints)
                         else:
-                            inf_traj = generate_idfm_2(model, x0, time_points=args.timepoints)
+                            inf_traj, attentions, last_hidden_states = generate_idfm(
+                                model,
+                                x0,
+                                args.inf_batch_size,
+                                time_points=args.timepoints,
+                                continuous_time=args.continuous_time,
+                                output_attentions=args.output_attentions
+                                )
+                            if args.output_attentions:
+                                heatmaps = plot_attentions(attentions)
+                                for i in range(len(heatmaps)):
+                                    wandb_dict[f"plots/Attention Layer {i}"] = heatmaps[i]
+                                umap_plot = plot_final_hidden_states(last_hidden_states)
+                                wandb_dict["plots/Last hidden states"] = wandb.Image(umap_plot)
                     else:
-                        inf_traj, attentions, last_hidden_states = generate_idfm(
-                            model,
-                            x0,
-                            args.inf_batch_size,
-                            time_points=args.timepoints,
-                            continuous_time=args.continuous_time,
-                            output_attentions=args.output_attentions
-                            )
-                        if args.output_attentions:
-                            heatmaps = plot_attentions(attentions)
-                            for i in range(len(heatmaps)):
-                                wandb_dict[f"plots/Attention Layer {i}"] = heatmaps[i]
-                            umap_plot = plot_final_hidden_states(last_hidden_states)
-                            wandb_dict["plots/Last hidden states"] = wandb.Image(umap_plot)
+                        x0 = multipoint_reshape(x0, args.pps)
+                        inf_traj = generate_ifm(model, x0, temp=args.temp, pps=args.pps, time_points=args.timepoints)
+                        inf_traj = unipoint_reshape(inf_traj, args.pps)
                     all_trajs.append(inf_traj)
                 all_trajs = torch.cat(all_trajs, dim=0)
 

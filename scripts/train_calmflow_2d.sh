@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=idfm              # Job name
+#SBATCH --job-name=2d_calmflow             # Job name
 #SBATCH --output logs/moons_%J.log        # Output log file
 #SBATCH --mail-type=ALL                            # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=daniel.levine@yale.edu                       # Where to send mail
@@ -18,16 +18,19 @@ module load CUDA/12.1
 conda activate c2s2
 cd /home/dfl32/project/ifm
 
-python idfm_multipoint.py \
+python calmflow_2d.py \
     --batch_size 256 \
     --inf_batch_size 256 \
-    --timepoints 100 \
-    --num_steps 100000 \
+    --timepoints 16 \
+    --num_steps 10000 \
     --hdim 64 \
     --nlayer 2 \
     --nhead 2 \
-    --lr 0.0001 \
-    --continuous_time \
-    --ve \
-    --attn_dropout 0.95 \
-    --sigma_max 10.0 \
+    --lr 0.001 \
+    --mlp_musig \
+    --use_vae \
+    --space_dim 1 \
+    --kl_weight 0.1 \
+    --pps 8 \
+    --temp 0.5 \
+    --ve
