@@ -35,10 +35,10 @@ class CaLMFlowModel(nn.Module):
         embs = self.encoder(inputs)
         hid_states = self.transformer.gpt_neox(inputs_embeds=embs, output_attentions=output_attentions)
         if self.use_vae:
-            outputs, latents, cond_dist = self.decoder(hid_states.last_hidden_state)
+            outputs, latents, cond_dist = self.decoder(hid_states.last_hidden_state, temperature=temp)
             return outputs, latents, cond_dist
         else:
-            outputs = self.decoder(hid_states.last_hidden_state+embs, temperature=temp)
+            outputs = self.decoder(hid_states.last_hidden_state)
         if output_attentions:
             return outputs, hid_states.attentions, hid_states.last_hidden_state
         return outputs, None, None
@@ -239,7 +239,107 @@ def parse_arguments():
         default=1.0,
         help="Temperature for inference with VAE"
     )
+    parser.add_argument(
+        "--generate_inputs",
+        action="store_true",
+        help="Use generated trajectories as input during training"
+    )
+    parser.add_argument(
+        "--random_labels",
+        action="store_true",
+        help="Uses random labels for intermediate timepoints in idfm"
+    )
+    parser.add_argument(
+        "--prob_weight",
+        type=float,
+        default=1.0,
+        help="Weighting for log probabilities term in loss"
+    )
+    parser.add_argument(
+        "--ve_inputs",
+        action="store_true",
+        help="Uses ve paths for inputs when using random labels for idfm"
+    )
+    parser.add_argument(
+        "--plot_conditional_inf",
+        action="store_true",
+        help="Plots using the conditional inference method"
+    )
+    parser.add_argument(
+        "--square_probs",
+        action="store_true",
+        help="Squares probabilities used if using random labels"
+    )
+    parser.add_argument(
+        "--add_noise_to_gen",
+        action="store_true",
+        help="Adds noise to generated inputs"
+    )
+    parser.add_argument(
+        "--gen_input_noise",
+        type=float,
+        default=0.1,
+        help="Amount of noise to generated inputs"
+    )
+    parser.add_argument(
+        "--add_noise_to_input",
+        action="store_true",
+        help="Adds noise to inputs while generating outputs"
+    )
+    parser.add_argument(
+        "--plot_train_trajs",
+        action="store_true",
+        help="Plot sample training trajectories"
+    )
+    parser.add_argument(
+        "--power",
+        action="store_true",
+        help="Raise training trajectories to randomly sampled powers to create curved training trajectories"
+    )
+    parser.add_argument(
+        "--predict_point",
+        action="store_true",
+        help="Predicts x1 instead of x1-x0"
+    )
+    parser.add_argument(
+        "--scale_denom",
+        action="store_true",
+        help="Scales the target point by 1/(1-t) when using 'predict_point'"
+    )
+    parser.add_argument(
+        "--predict_solver_step",
+        action="store_true",
+        help="Model directly predicts Euler solver step"
+    )
+    parser.add_argument(
+        "--scale_factor",
+        type=float,
+        default=1.0,
+        help="Amount to scale inference step size by"
+    )
     return parser.parse_args()
+
+def interpolate_tensors(A, B, time_points):
+    # Ensure A and B have the same shape
+    assert A.shape == B.shape, "A and B must have the same shape"
+    
+    # Get batch size and feature dimensions
+    batch_size, feature_dim = A.shape
+    
+    # Initialize the new tensor
+    new_tensor = torch.zeros((batch_size, time_points, feature_dim), device=A.device)
+    
+    # Set the first and last time points
+    new_tensor[:, 0, :] = A
+    new_tensor[:, time_points-1, :] = B
+    
+    # Interpolate the intermediate time points
+    for i in range(1, time_points-1):
+        t_i = i / (time_points - 1)  # Calculate the interpolation factor
+        new_tensor[:, i, :] = A * (1 - t_i) + B * t_i
+    
+    return new_tensor
+
 
 def multipoint_reshape(X, points_per_sample):
 
@@ -261,32 +361,85 @@ def unipoint_reshape(X, points_per_sample):
     x_reshaped = X.reshape(batch_size, seq_len//points_per_sample, points_per_sample, feature_dim).permute(0, 2, 1, 3).reshape(new_batch_size, seq_len//points_per_sample, feature_dim)
 
     return x_reshaped
+
+def generate_random_labels(X, dataset_class, device='cuda', time_points=16):
+    all_labels = []
+    for i in range(time_points):
+        labels = dataset_class.generate_data(batch_size=X.shape[0]).to(device) # shape batch_size x feature_dim
+        all_labels.append(labels)
     
-def generate_straight_paths(X, Y, device='cuda', time_points=16, path_sigma=0.0, idfm=False):
+    all_labels = torch.stack(all_labels, dim=1).to(device)
+    
+    return all_labels
+    
+def generate_straight_paths(
+    X,
+    Y,
+    device='cuda',
+    time_points=16,
+    path_sigma=0.0,
+    idfm=False,
+    random_labels=False,
+    power=False,
+    predict_point=False
+    ):
     W = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
+    eps = 1e-5
+    if random_labels:
+        means = torch.zeros(X.shape[0], time_points, X.shape[1]).to(device)
+        sigmas = torch.full((X.shape[0], time_points, X.shape[1]), path_sigma+0.1).to(device)
 
     # Define the time points, evenly spaced from 0 to 1, inclusive
-    times = torch.linspace(0, 1, time_points)
+    times = torch.linspace(0, 1, time_points).to(device)
 
     # Generate W where each slice W[:, i, :] is based on the linear combination of X and Y
+    if power:
+        batch_size = X.shape[0]
+        power_tensor = eps + torch.rand(batch_size).to(device) * (5 - eps)
+        power_tensor = power_tensor.view(batch_size, 1)
     for i, t in enumerate(times):
-        if path_sigma > 0.0:
-            variance = path_sigma**2
+        if (path_sigma > 0.0):
+
+            variance = (((1-t)+eps)*path_sigma)**2
             # Calculate the convex combination of X and Y
             mean = (1 - t) * X + t * Y
 
             # Sample from a Gaussian with the calculated mean and variance
-            W[:, i, :] = mean + torch.randn_like(X).to(device) * variance
+            if power:
+                t = torch.tensor(t).repeat(batch_size, 1).to(device)
+                W[:, i, :] = (((1 - t)**power_tensor) * X + (t**power_tensor) * Y) + torch.randn_like(X).to(device) * variance
+            else:
+                W[:, i, :] = mean + torch.randn_like(X).to(device) * variance
+            if random_labels:
+                means[:, i, :] = mean
+                sigmas[:, i, :] = torch.full_like(mean, path_sigma).to(device)
+        elif power:
+            if random_labels:
+                mean = (1 - t) * X + t * Y
+                means[:, i, :] = mean
+            batch_size = X.shape[0]
+
+            # Reshape t and power_tensor to allow broadcasting (if necessary)
+            t = torch.tensor(t).repeat(batch_size, 1).to(device)
+
+            # Calculate the modified convex combination
+            W[:, i, :] = ((1 - t)**power_tensor) * X + (t**power_tensor) * Y
         else:
             W[:, i, :] = (((1 - t) * X) + (t * Y)).to(device)
     
     W = W.to(dtype=torch.float32)
     if idfm:
-        labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
-        return W, labels
+        dist = None
+        if predict_point:
+            labels = Y.unsqueeze(1).repeat(1,time_points,1)
+        else:
+            labels = (Y.unsqueeze(1) - X.unsqueeze(1)).repeat(1,time_points,1)
+        if random_labels:
+            dist = Normal(loc=means, scale=sigmas)
+        return W, labels, dist
     
     labels = W.detach().clone()
-    return W, labels
+    return W, labels, None
 
 def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma_max=1e1, use_last=False, linear_sched=False, idfm=False):
     sigma_min = torch.tensor(sigma_min)
@@ -331,7 +484,7 @@ def generate_VE_paths(X, Y, device='cuda', time_points=16, sigma_min=1e-4, sigma
         labels = W.detach().clone()
     return W, labels
 
-def generate_ifm(model, inputs, time_points=16, space_dim=1, temp=1.0, pps=1, continuous_time=False, device='cuda', output_attentions=False):
+def generate_ifm(model, inputs, time_points=16, space_dim=1, temp=1.0, pps=1, continuous_time=False, device='cuda', output_attentions=False, use_vae=True):
     for _ in range(time_points-1):
         outputs = model.encoder(inputs)
 
@@ -343,26 +496,82 @@ def generate_ifm(model, inputs, time_points=16, space_dim=1, temp=1.0, pps=1, co
 
         outputs = model.transformer.gpt_neox(inputs_embeds=outputs).last_hidden_state
 
-        outputs, _, _ = model.decoder(outputs, temperature=temp)
+        if not use_vae:
+            outputs = model.decoder(outputs)
+        else:
+            outputs, _, _ = model.decoder(outputs, temperature=temp)
         last_outputs = outputs[:, -pps:, :]
         inputs = torch.concat([inputs, last_outputs], axis=1)
     return inputs
 
-def generate_idfm(model, inputs, batch_size, time_points=16, continuous_time=False, device='cuda', output_attentions=False):
+def generate_idfm(
+    model,
+    inputs,
+    batch_size,
+    time_points=16,
+    continuous_time=False,
+    device='cuda',
+    output_attentions=False,
+    add_noise_to_gen=False,
+    add_noise_to_input=False,
+    predict_point=False,
+    scale_denom=False,
+    predict_solver_step=False,
+    noise=0.1,
+    input_noise=0.0,
+    scale_factor=1.0
+    ):
     """Generate using Eulers method
     """
-    dt = 1/(time_points-1)
+    dt = 1/(time_points-1)*scale_factor
     if continuous_time:
         t = torch.linspace(0.0, 1.0, time_points).view(1, time_points, 1).expand(batch_size, time_points, 1).to(device)
     for i in range(time_points-1):
         if continuous_time:
             inputs = torch.cat([inputs, t[:, :i+1]], dim=-1)
-        outputs, attentions, last_hidden_states = model(inputs, output_attentions=output_attentions)
-        new_output = inputs[:, -1, :-1] + outputs[:, -1]*dt
-        inputs = torch.cat([inputs[:, :, :-1], new_output.unsqueeze(1)], dim=1)
+            outputs, attentions, last_hidden_states = model(inputs, output_attentions=output_attentions)
+            new_output = inputs[:, -1, :-1] + outputs[:, -1]*dt
+            inputs = torch.cat([inputs[:, :, :-1], new_output.unsqueeze(1)], dim=1)
+        else:
+            model_inputs = inputs
+            if add_noise_to_input:
+                model_inputs = inputs + torch.randn_like(inputs).to(device) * input_noise
+            outputs, attentions, last_hidden_states = model(model_inputs, output_attentions=output_attentions)
+            if predict_point:
+                # move towards x1 at time t by taking a step ((x1-xt)/(1-t))*dt
+                dx = outputs[:, -1]-inputs[:, -1]
+                time_scale = 1.0
+                if scale_denom:
+                    time_scale = 1.0/(1.0-((i+1)/time_points))
+                new_output = inputs[:, -1] + dx*dt*time_scale
+            elif predict_solver_step:
+                new_output = outputs[:, -1]
+            else:
+                new_output = inputs[:, -1] + outputs[:, -1]*dt
+            inputs = torch.cat([inputs[:, :], new_output.unsqueeze(1)], dim=1)
+    if add_noise_to_gen:
+        inputs = inputs + torch.randn_like(inputs).to(device) * noise
     if output_attentions:
         return inputs, attentions, last_hidden_states
     return inputs, None, None
+
+def generate_cond_idfm(model, inputs, batch_size, time_points=16, device='cuda', output_attentions=False):
+    """Generate using Eulers method
+    """
+    dt = 1/(time_points-1)
+    model_inputs = inputs
+    trajectories = inputs
+    for i in range(time_points-1):
+        outputs, attentions, last_hidden_states = model(model_inputs, output_attentions=output_attentions)
+        new_output = model_inputs[:, -1] + outputs[:, -1]*dt
+        trajectories = torch.cat([trajectories[:, :], new_output.unsqueeze(1)], dim=1)
+        # logger.info(f"\nINPUT SHAPE {inputs.shape}")
+        # logger.info(f"\nNEW OUTPUT SHAPE {new_output.shape}")
+        model_inputs = interpolate_tensors(inputs[:,0,:], new_output, i+2)
+
+    if output_attentions:
+        return trajectories, attentions, last_hidden_states
+    return trajectories, None, None
 
 def generate_idfm_2(model, inputs, time_points=16):
     """Generate using 2nd order Runge-Kutta (Midpoint) method"""
@@ -547,7 +756,10 @@ def orthogonality_regularizer(hidden_states):
 def main(args):
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"idfm-2moons-tp{args.timepoints}-pps{args.pps}-temp{args.temp}-{now}"
+    if args.idfm:
+        run_name = f"idfm-2moons-tp{args.timepoints}-pathsig{args.path_sigma}-{now}"
+    else:
+        run_name = f"idfm-2moons-tp{args.timepoints}-pps{args.pps}-temp{args.temp}-{now}"
     device = torch.device("cuda")
 
     eight_gaussian_dataset = IFMdatasets(batch_size = args.batch_size, dataset_name="8gaussians", dim=2, gaussian_var=0.1)
@@ -616,17 +828,25 @@ def main(args):
                 idfm=args.idfm
             )
         else: 
-            model_inputs, labels = generate_straight_paths(
+            model_inputs, labels, dist = generate_straight_paths(
                 x0,
                 x1,
                 time_points=args.timepoints,
                 path_sigma=args.path_sigma,
-                idfm=args.idfm
+                idfm=args.idfm,
+                random_labels=args.random_labels,
+                power=args.power,
+                predict_point=args.predict_point
             )
 
         if args.continuous_time:
             model_inputs = concat_time(model_inputs, args.batch_size, args.timepoints, device)
         if not args.idfm:
+            if args.generate_inputs:
+                with torch.no_grad():
+                    x0 = x0.unsqueeze(1)
+                    x0 = multipoint_reshape(x0, args.pps)
+                    model_inputs = generate_ifm(model, x0, pps=args.pps, time_points=args.timepoints, use_vae=args.use_vae)
             model_inputs = multipoint_reshape(model_inputs, args.pps)
             labels = multipoint_reshape(labels, args.pps)
             outputs, latents, cond_dist = model(model_inputs, output_attentions=args.orth_reg)
@@ -634,19 +854,83 @@ def main(args):
             gt = labels[:,args.pps:,:]
             loss_fn = MSELoss(reduction='none')
             recon_loss = loss_fn(pred, gt)
-            pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
-            kl_divergence_z = kl_divergence(
-                cond_dist,
-                pz
-            ).sum(dim=-1)[:,:-args.space_dim*args.pps]
-            recon_loss = torch.mean(recon_loss.sum(-1))
-            kl_loss = torch.mean(kl_divergence_z)
-            loss = recon_loss + (kl_loss*args.kl_weight)
+            if args.use_vae:
+                pz = Normal(torch.zeros_like(latents), torch.ones_like(latents))
+                kl_divergence_z = kl_divergence(
+                    cond_dist,
+                    pz
+                ).sum(dim=-1)[:,:-args.space_dim*args.pps]
+                recon_loss = torch.mean(recon_loss.sum(-1))
+                kl_loss = torch.mean(kl_divergence_z)
+                loss = recon_loss + (kl_loss*args.kl_weight)
+            else:
+                loss = torch.mean(recon_loss.sum(-1))
         else:
+            probs = 1.0
+            if args.random_labels:
+                permutation = torch.randperm(model_inputs.size(0))
+                if args.ve_inputs:
+                    x0 = eight_gaussian_dataset.generate_data(batch_size=args.batch_size).to(device)
+                    x1 = two_moon_dataset.generate_data(batch_size=args.batch_size).to(device)
+                    model_inputs, _ = generate_VE_paths(
+                        x0,
+                        x1,
+                        time_points=args.timepoints,
+                        sigma_min=args.sigma_min,
+                        sigma_max=args.sigma_max,
+                        use_last=args.use_last,
+                        linear_sched=args.linear_sched,
+                        idfm=args.idfm
+                    )
+                elif args.generate_inputs:
+                    with torch.no_grad():
+                        x0 = eight_gaussian_dataset.generate_data(batch_size=args.batch_size).to(device)
+                        x0 = x0.unsqueeze(1)
+                        # x0 = multipoint_reshape(x0, args.pps)
+                        model_inputs, _, _ = generate_idfm(
+                            model,
+                            x0,
+                            x0.shape[0],
+                            time_points=args.timepoints,
+                            continuous_time=args.continuous_time,
+                            add_noise_to_gen=args.add_noise_to_gen,
+                            noise=args.gen_input_noise,
+                            scale_factor=args.scale_factor
+                        )
+                else:
+                    model_inputs = model_inputs[permutation]
+                probs = dist.log_prob(model_inputs).exp()
+                if args.square_probs:
+                    probs = torch.pow(probs, 2.0)
+            elif args.generate_inputs:
+                with torch.no_grad():
+                    x0 = x0.unsqueeze(1)
+                    # x0 = multipoint_reshape(x0, args.pps)
+                    model_inputs, _, _ = generate_idfm(
+                        model,
+                        x0,
+                        x0.shape[0],
+                        time_points=args.timepoints,
+                        continuous_time=args.continuous_time,
+                        add_noise_to_gen=args.add_noise_to_gen,
+                        noise=args.gen_input_noise,
+                        scale_factor=args.scale_factor
+                    )
             outputs, _, last_hidden_states = model(model_inputs, output_attentions=args.orth_reg)
             pred = outputs[:, :-args.pps, :].contiguous()
-            gt = labels[:,args.pps:,:]
-            loss = mse_loss(pred, gt, reduction="none").sum(dim=-1).mean()
+            gt = labels
+            if args.predict_solver_step:
+                dt = 1/(args.timepoints-1)
+                if args.predict_point:
+                    time_scale = 1.0
+                    # if args.scale_denom:
+                    #     time_scale = 1.0/(1.0-((i+1)/args.timepoints))
+                    gt = model_inputs + ((labels-model_inputs)*dt*time_scale)
+                else:
+                    gt = model_inputs + (labels*dt)
+            gt = gt[:,args.pps:,:]
+            loss = (mse_loss(pred, gt, reduction="none")*probs[:, :-args.pps, :]).sum(dim=-1).mean()
+
 
         if args.orth_reg:
             orth_reg = orthogonality_regularizer(last_hidden_states)
@@ -656,12 +940,23 @@ def main(args):
 
         # Log to wandb
         if (step+1) % args.wandb_log_steps == 0:
+
             samples = eight_gaussian_dataset.generate_data(batch_size=args.num_inf_trajs).unsqueeze(1).to("cuda")
             model.eval()
             wandb_dict = {"loss": loss.item()}
+
+            if args.plot_train_trajs:
+                X = eight_gaussian_dataset.generate_data(batch_size=64).to(device)
+                Y = two_moon_dataset.generate_data(batch_size=64).to(device)
+                train_paths, _, _ = generate_straight_paths(X, Y, time_points=args.timepoints, path_sigma=args.path_sigma, power=args.power, predict_point=args.predict_point)
+                train_plt = plot_inf_traj(train_paths)
+                wandb_dict["plots/train_plot"] = wandb.Image(train_plt)
+
             with torch.no_grad():
                 num_inf_steps = max(args.num_inf_trajs//args.inf_batch_size, 1)
                 all_trajs = []
+                if args.add_noise_to_input:
+                    all_noise_trajs = []
                 for step in range(num_inf_steps):
                     x0 = samples[step*args.inf_batch_size:(step+1)*args.inf_batch_size]
                     if args.idfm:
@@ -672,13 +967,32 @@ def main(args):
                                 inf_traj = generate_idfm_2(model, x0, time_points=args.timepoints)
                         else:
                             inf_traj, attentions, last_hidden_states = generate_idfm(
-                                model,
-                                x0,
-                                args.inf_batch_size,
-                                time_points=args.timepoints,
-                                continuous_time=args.continuous_time,
-                                output_attentions=args.output_attentions
-                                )
+                                    model,
+                                    x0,
+                                    args.inf_batch_size,
+                                    time_points=args.timepoints,
+                                    continuous_time=args.continuous_time,
+                                    output_attentions=args.output_attentions,
+                                    scale_factor=args.scale_factor,
+                                    predict_point=args.predict_point,
+                                    scale_denom=args.scale_denom,
+                                    predict_solver_step=args.predict_solver_step
+                                    )
+                            if args.add_noise_to_input:
+                                noise_inf_traj, _, _ = generate_idfm(
+                                    model,
+                                    x0,
+                                    args.inf_batch_size,
+                                    time_points=args.timepoints,
+                                    continuous_time=args.continuous_time,
+                                    output_attentions=args.output_attentions,
+                                    add_noise_to_input=args.add_noise_to_input,
+                                    input_noise=args.path_sigma,
+                                    scale_factor=args.scale_factor,
+                                    predict_point=args.predict_point,
+                                    scale_denom=args.scale_denom,
+                                    predict_solver_step=args.predict_solver_step
+                                    )
                             if args.output_attentions:
                                 heatmaps = plot_attentions(attentions)
                                 for i in range(len(heatmaps)):
@@ -687,10 +1001,36 @@ def main(args):
                                 wandb_dict["plots/Last hidden states"] = wandb.Image(umap_plot)
                     else:
                         x0 = multipoint_reshape(x0, args.pps)
-                        inf_traj = generate_ifm(model, x0, temp=args.temp, pps=args.pps, time_points=args.timepoints)
+                        inf_traj = generate_ifm(model, x0, temp=args.temp, pps=args.pps, time_points=args.timepoints, use_vae=args.use_vae)
                         inf_traj = unipoint_reshape(inf_traj, args.pps)
+                    if args.add_noise_to_input:
+                        all_noise_trajs.append(noise_inf_traj)
                     all_trajs.append(inf_traj)
                 all_trajs = torch.cat(all_trajs, dim=0)
+                if args.add_noise_to_input:
+                    all_noise_trajs = torch.cat(all_noise_trajs, dim=0)
+                    noise_plt = plot_inf_traj(all_noise_trajs)
+                    wandb_dict["plots/plot_with_noise_inputs"] = wandb.Image(noise_plt)
+
+
+                if args.plot_conditional_inf:
+                    num_inf_steps = max(args.num_inf_trajs//args.inf_batch_size, 1)
+                    all_cond_trajs = []
+                    for step in range(num_inf_steps):
+                        x0 = samples[step*args.inf_batch_size:(step+1)*args.inf_batch_size]
+                        inf_traj, attentions, last_hidden_states = generate_cond_idfm(
+                            model,
+                            x0,
+                            args.inf_batch_size,
+                            time_points=args.timepoints,
+                            output_attentions=args.output_attentions
+                        )
+                        all_cond_trajs.append(inf_traj)
+                    all_cond_trajs = torch.cat(all_cond_trajs, dim=0)
+                    cond_plt = plot_inf_traj(all_cond_trajs)
+                    wandb_dict["plots/cond_inf_plot"] = wandb.Image(cond_plt)
+                    
+
 
                 plt = plot_inf_traj(all_trajs)
                 wandb_dict["plots/plot"] = wandb.Image(plt)

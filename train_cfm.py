@@ -103,6 +103,11 @@ def parse_arguments():
         type=int,
         default=100
     )
+    parser.add_argument(
+        "--type",
+        type=str,
+        default='default'
+    )
     return parser.parse_args()
 
 
@@ -225,9 +230,11 @@ def run_eval_loop(model, val_dataloader, device, args):
 
 
 def main(args):
+    logger.info(f"CFM Method {args.type}")
+    assert args.type in ('default', 'ot', 'sb'), f"'--type' flag needs to be in ('default', 'ot', 'sb'). Currently {args.type}"
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"cfm-mlp-{now}"
+    run_name = f"cfm-mlp-{args.type}-{now}"
     device = torch.device("cuda")
 
     model = MLP(dim=args.input_dim, w=args.mlp_width, time_varying=True).to(device)
@@ -269,6 +276,14 @@ def main(args):
 
     train_dataloader = cycle(DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True))
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    if args.type == 'ot':
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=args.sigma)
+    elif args.type == 'sb':
+        FM = SchrodingerBridgeConditionalFlowMatcher(sigma=args.sigma, ot_method="exact")
+    else:
+        FM = ConditionalFlowMatcher(sigma=args.sigma)
+
     start_step = 0
     if args.checkpoint_step is not None:
         start_step = args.checkpoint_step
@@ -281,9 +296,11 @@ def main(args):
 
         x0 = torch.normal(0.0, 1.0**0.5, size=x1.shape).to(device)
 
-        t = torch.rand(x0.shape[0]).type_as(x0)
-        xt = sample_conditional_pt(x0, x1, t, sigma=args.sigma)
-        ut = compute_conditional_vector_field(x0, x1)
+        t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
+
+        # t = torch.rand(x0.shape[0]).type_as(x0)
+        # xt = sample_conditional_pt(x0, x1, t, sigma=args.sigma)
+        # ut = compute_conditional_vector_field(x0, x1)
 
         vt = model(torch.cat([xt, t[:, None]], dim=-1))
         loss = torch.mean((vt - ut) ** 2)

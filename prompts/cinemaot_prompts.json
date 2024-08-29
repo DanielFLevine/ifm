@@ -1,5 +1,12 @@
 {
-    "prefix": [
-        "Stimulate the following {cell_type} cell with {perturbation}: "
-    ]
+    "prefix": {
+        "perturbation":
+        [
+            "Generate a {cell_type} cell stimulated with {perturbation} and exposure {chronicity}: "
+        ],
+        "control":
+        [
+            "Generate a {cell_type} cell stimulated with no stimulation and exposure {chronicity}: "
+        ]
+    }
 }

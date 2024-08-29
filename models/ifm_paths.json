@@ -1,0 +1,20 @@
+{
+    "pretrained_weights": {
+        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space1-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-12",
+        "2": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space2-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-12",
+        "3": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space3-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-16",
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space5-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-16",
+        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space10-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-12",
+        "20": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space20-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-11_10-33-12",
+        "50": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space50-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-08-07_21-55-58",
+        "640": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d640idim_2d640nheads_2d4nblocks_2d2-space1-postvaeTrue-mlpencTrue-preweightsTrue-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-29_08-49-59"
+    },
+
+    "random_weights": {
+        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space1-postvaeTrue-mlpencTrue-preweightsFalse-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-07-29_08-51-19",
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space5-postvaeTrue-mlpencTrue-preweightsFalse-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-08-07_22-13-13",
+        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space10-postvaeTrue-mlpencTrue-preweightsFalse-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-08-07_21-39-30",
+        "20": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space20-postvaeTrue-mlpencTrue-preweightsFalse-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-08-07_22-12-52",
+        "50": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim_2d64idim_2d64nheads_2d4nblocks_2d2-space50-postvaeTrue-mlpencTrue-preweightsFalse-pca1000-datasizeNone-timepoints16-straightpathTrue-drop0.0ifm-2024-08-07_22-13-03/checkpoint-99000"
+    }
+}

@@ -18,9 +18,9 @@ module load CUDA/12.1
 conda activate c2s2
 cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
-export SPACE=50
+export SPACE=10
 export TIME_POINTS=16
-export POINTS_PER_SAMPLE=4
+export POINTS_PER_SAMPLE=1
 export SAMPLES_PER_SEQUENCE=2
 export DT=2024-07-09_17-10-16
 export PER_DEVICE_BATCH_SIZE=128
@@ -42,9 +42,9 @@ python ifm_perturbation_clean.py \
     --save_steps 1000 \
     --e2e \
     --train_custom \
-    --hdim_2d 64 \
-    --idim_2d 64 \
-    --nheads_2d 4 \
+    --hdim_2d 256 \
+    --idim_2d 1024 \
+    --nheads_2d 8 \
     --nblocks_2d 2 \
     --straight_paths \
     --use_vae \
@@ -53,5 +53,4 @@ python ifm_perturbation_clean.py \
     --reshape_postvae \
     --mlp_enc \
     --mlp_musig \
-    --use_pretrained \
     --points_per_sample $POINTS_PER_SAMPLE

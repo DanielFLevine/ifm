@@ -228,7 +228,7 @@ def main(args):
                 plot_umap(
                     pca_sampled_expression_data,
                     cells,
-                    plot_name="cfm_umap.png"
+                    plot_name="cfm_sb_umap.png"
                 )
 
         if args.umap_embed:

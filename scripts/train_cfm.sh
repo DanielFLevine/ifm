@@ -22,6 +22,6 @@ export TOKENIZERS_PARALLELISM=true
 python train_cfm.py \
     --llm_dataset_path /home/dfl32/scratch/cinemaot_data/ifm_hf_ds/gaussian_pca1000_hf_ds_new \
     --input_dim 1000 \
-    --mlp_width 2048 \
+    --mlp_width 4096 \
     --num_train_steps 1000000 \
-    --save_steps 5000 
+    --save_steps 5000 \

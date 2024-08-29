@@ -99,6 +99,11 @@ def parse_arguments():
         type=str,
         default='euler'
     )
+    parser.add_argument(
+        "--type",
+        type=str,
+        default='default'
+    )
     return parser.parse_args()
 
 def save_model(model, step, run_name, directory="/home/dfl32/scratch/training-runs/cfm/"):
@@ -183,9 +188,11 @@ def generate_idfm(model, inputs, batch_size, time_points=16, device='cuda'):
 
 
 def main(args):
+    logger.info(f"CFM Method {args.type}")
+    assert args.type in ('default', 'ot', 'sb'), f"'--type' flag needs to be in ('default', 'ot', 'sb'). Currently {args.type}"
     now = datetime.now()
     now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"cfm-2moons-{args.timepoints}-{now}"
+    run_name = f"cfm-2moons-tp{args.timepoints}-{args.type}-{now}"
     device = torch.device("cuda")
 
     eight_gaussian_dataset = IFMdatasets(batch_size = args.batch_size, dataset_name="8gaussians", dim=2, gaussian_var=0.1)
@@ -201,16 +208,23 @@ def main(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    if args.type == 'ot':
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=args.path_sigma)
+    elif args.type == 'sb':
+        FM = SchrodingerBridgeConditionalFlowMatcher(sigma=args.path_sigma, ot_method="exact")
+    else:
+        FM = ConditionalFlowMatcher(sigma=args.path_sigma)
 
     for step in tqdm(range(args.num_steps)):
         optimizer.zero_grad()
         x0 = eight_gaussian_dataset.generate_data(batch_size=args.batch_size).to(device)
         x1 = two_moon_dataset.generate_data(batch_size=args.batch_size).to(device)
         
-
-        t = torch.rand(x0.shape[0]).type_as(x0).to(device)
-        xt = sample_conditional_pt(x0, x1, t, sigma=args.path_sigma).to(device)
-        ut = compute_conditional_vector_field(x0, x1).to(device)
+        t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
+        # else:
+        #     t = torch.rand(x0.shape[0]).type_as(x0).to(device)
+        #     xt = sample_conditional_pt(x0, x1, t, sigma=args.path_sigma).to(device)
+        #     ut = compute_conditional_vector_field(x0, x1).to(device)
 
         vt = model(torch.cat([xt, t[:, None]], dim=-1))
         loss = torch.mean((vt - ut) ** 2)

@@ -23,11 +23,10 @@ export TOTAL_SAMPLES=20000
 export POINTS_PER_SAMPLE=1
 
 python compute_unconditional_corrs_ifm.py \
-    --model_json_path /home/dfl32/project/ifm/models/ifm_paths2.json \
-    --pretrained_weights \
+    --model_json_path /home/dfl32/project/ifm/models/ifm_big_models.json \
     --num_samples $(($TOTAL_SAMPLES / $POINTS_PER_SAMPLE)) \
     --input_dim 1000 \
-    --temp 1.4 \
+    --temp 1.0 \
     --batch_size 100 \
     --num_repeats 5 \
     --hvgs 50 \

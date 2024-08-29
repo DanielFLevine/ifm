@@ -21,7 +21,8 @@ cd /home/dfl32/project/ifm
 python train_cfm_2d.py \
     --batch_size 256 \
     --inf_batch_size 1024 \
-    --path_sigma 0.0 \
+    --path_sigma 0.5 \
     --lr 0.01 \
     --timepoints 100 \
-    --ode_solver euler
+    --ode_solver euler \
+    --type sb

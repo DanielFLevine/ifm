@@ -1,0 +1,12 @@
+{
+    "pretrained_weights": {
+        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space1-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_10-37-34",
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_11-32-37",
+        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space10-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_12-07-17"
+    },
+    "random_weights": {
+        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space1-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_14-29-56",
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_14-29-56",
+        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space10-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_15-09-48"
+    }
+}
