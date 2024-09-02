@@ -7,6 +7,9 @@ import numpy as np
 import torch
 import umap
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from ipdb import set_trace
+import seaborn as sns
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,7 +18,8 @@ def plot_umap(
     gt_data,
     gen_data,
     plot_name,
-    save_dir="/home/dfl32/project/ifm/umaps/"
+    labels: dict,
+    save_dir="/home/sh2748/ifm/umaps/"
 ):
     
     # Combine the two datasets
@@ -31,7 +35,9 @@ def plot_umap(
     umap_gt = umap_embedding[:num_samples]
     umap_gen = umap_embedding[num_samples:]
 
+    
     # Plot the results
+    umap_name = "_total_umap.png"
     plt.figure(figsize=(5, 4))
     plt.scatter(umap_gt[:, 0], umap_gt[:, 1], color='blue', label='ground truth', alpha=0.5, s=0.5)
     plt.scatter(umap_gen[:, 0], umap_gen[:, 1], color='red', label='generated', alpha=0.5, s=0.5)
@@ -42,9 +48,55 @@ def plot_umap(
     plt.xlabel('UMAP 1')
     plt.ylabel('UMAP 2')
 
-    save_path = os.path.join(save_dir, plot_name)
+    save_path = os.path.join(save_dir, plot_name+umap_name)
     plt.savefig(save_path, bbox_inches='tight')
     logger.info(f"UMAP saved to {save_path}")
+    plt.close()
+
+    # set_trace()
+    for keys in labels:
+        # Plot the results with color according to the label
+        umap_name=f"_GT_{keys}.png"
+        # label_encoder = LabelEncoder()
+        # numeric_labels = label_encoder.fit_transform(labels[keys])
+        plt.figure(figsize=(10, 8))
+        # plt.scatter(umap_gt[:, 0], umap_gt[:, 1], c=numeric_labels, cmap='viridis', alpha=0.5, s=0.5)
+        # handles = [plt.Line2D([0], [0], marker='o', color='w', label=label_encoder.classes_[i],
+        #               markersize=10, markerfacecolor=plt.cm.viridis(i / len(label_encoder.classes_)))
+        #    for i in range(len(label_encoder.classes_))]
+        # plt.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5))
+        sns.scatterplot(x=umap_gt[:, 0], y=umap_gt[:, 1], hue=labels[keys], alpha=0.7, s=4)
+        # plt.xticks([])
+        # plt.yticks([])
+        plt.title(f'UMAP of GT data colored by {keys}')
+        plt.xlabel('UMAP 1')
+        plt.ylabel('UMAP 2')
+        save_path = os.path.join(save_dir, plot_name+umap_name)
+        plt.savefig(save_path, bbox_inches='tight')
+        logger.info(f"UMAP saved to {save_path}")
+        plt.close()
+        
+
+
+
+
+        umap_name=f"_generated_{keys}.png"
+        plt.figure(figsize=(10, 8))
+        # plt.scatter(umap_gen[:, 0], umap_gen[:, 1], c=numeric_labels, cmap='viridis', alpha=0.5, s=0.5)
+        # handles = [plt.Line2D([0], [0], marker='o', color='w', label=label_encoder.classes_[i],
+        #               markersize=10, markerfacecolor=plt.cm.viridis(i / len(label_encoder.classes_)))
+        #    for i in range(len(label_encoder.classes_))]
+        # plt.legend(handles=handles, loc='center left', bbox_to_anchor=(1, 0.5))
+        sns.scatterplot(x=umap_gen[:, 0], y=umap_gen[:, 1], hue=labels[keys], alpha=0.7, s=4)
+        # plt.xticks([])
+        # plt.yticks([])
+        plt.title(f'UMAP of IFM generated data colored by {keys}')
+        plt.xlabel('UMAP 1')
+        plt.ylabel('UMAP 2')
+        save_path = os.path.join(save_dir, plot_name+umap_name)
+        plt.savefig(save_path, bbox_inches='tight')
+        logger.info(f"UMAP saved to {save_path}")
+        plt.close()
 
 def plot_umap_after_train(
     gt_pca,

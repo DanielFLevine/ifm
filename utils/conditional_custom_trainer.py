@@ -17,6 +17,7 @@ from transformers.trainer_utils import seed_worker
 from transformers.utils import (
     logging,
 )
+from ipdb import set_trace
 
 from torch.distributions import Normal, kl_divergence
 
@@ -127,7 +128,6 @@ class ConditionalLLMVAETrainer(Trainer):
         else:
             return dataset.remove_columns(ignored_columns)
 
-
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
         """
         Prepares one `data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
@@ -185,7 +185,7 @@ class ConditionalLLMVAETrainer(Trainer):
         prefix_tokens = self.build_and_tokenize_prefixes(inputs, self.prompts, self.tokenizer)
         prefix_input_ids = prefix_tokens['prefix_input_ids']
         prefix_tokens_attention_mask = prefix_tokens['prefix_attention_mask'] # shape batch_size x seq_len
-
+        self.prefix_length = prefix_input_ids.shape[1]
         path_tens = self.generate_straight_paths(inputs['expression'], device=model.device, time_points=self.time_points)
         path_tens = self.multipoint_reshape(path_tens, self.points_per_sample)
 
@@ -200,7 +200,7 @@ class ConditionalLLMVAETrainer(Trainer):
         path_emb = path_emb.view(batch_size, seq_len, self.space_dim, feature // self.space_dim)
         path_emb = path_emb.view(batch_size, seq_len* self.space_dim, feature // self.space_dim)
         input_emb = torch.concat([prefix_emb, path_emb], dim=1)
-
+        
         # Extend prefix_tokens_attention_mask to match the length of input_emb
         attention_mask = torch.cat(
             [
@@ -244,9 +244,11 @@ class ConditionalLLMVAETrainer(Trainer):
         """
         with autocast():
 
-            outputs = model.gpt_neox(attention_mask=attention_mask, inputs_embeds=inputs).last_hidden_state
-            outputs, latents, cond_dist = model.cell_dec(outputs)
+            outputs = model.gpt_neox(attention_mask=attention_mask, inputs_embeds=inputs).last_hidden_state # [batch_size, prefix_leng+num_time_points*space_dim, d_model]
+            outputs = outputs[:, self.prefix_length:, ...]
 
+            outputs, latents, cond_dist = model.cell_dec(outputs) # [batch_size, n_timepoint, feature_dim]
+            
             # last points_per_sample correspond to final time point, so we ignore those
             outputs_for_loss = outputs[:, -labels.shape[1]:-self.points_per_sample, :].contiguous()
             labels = labels[:, self.points_per_sample:, :].contiguous()
