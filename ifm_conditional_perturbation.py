@@ -18,6 +18,7 @@ from transformers import (
 from utils.conditional_custom_trainer import ConditionalLLMVAETrainer
 from utils.modules import CustomVAEDecoder, TwoLayerMLP
 from utils.parser import parse_arguments
+from ipdb import set_trace
 
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
@@ -44,7 +45,7 @@ def main(args):
     val_dataset = load_from_disk(os.path.join(dataset_path, 'val_ds'))
     val_dataset = val_dataset.select(range(min(len(val_dataset), args.eval_dataset_size)))
     input_dim = len(val_dataset[0]['expression'])
-
+    # set_trace()
     assert torch.cuda.is_available(), "CUDA unavailable"
     device = torch.device("cuda")
 
@@ -125,6 +126,8 @@ def main(args):
         }
 
     output_dir = args.output_dir + f"/{run_name}"
+    output_dir = os.path.join(output_dir, args.pert_split)
+    os.makedirs(output_dir, exist_ok=True)
 
     train_args = TrainingArguments(
         debug="underflow_overflow",

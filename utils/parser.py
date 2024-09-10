@@ -17,7 +17,7 @@ def parse_arguments():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/home/dfl32/scratch/training-runs",
+        default="/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs",
         help="Where to output saved checkpoints"
     )
     parser.add_argument(
@@ -74,7 +74,7 @@ def parse_arguments():
     parser.add_argument(
         "--wandb_project_name",
         type=str,
-        default="IFM",
+        default="IFM_SingleCell",
         help="Project name used in wandb"
     )
     parser.add_argument(

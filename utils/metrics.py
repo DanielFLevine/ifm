@@ -6,11 +6,15 @@ import torch
 import umap
 from sklearn.metrics import pairwise
 from scipy.spatial.distance import cdist
+from ipdb import set_trace
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def mmd_rbf(X, Y, gamma=2.0):
+def mmd_rbf(X, Y, gamma=1.0):
     """MMD using rbf (gaussian) kernel (i.e., k(x,y) = exp(-gamma * ||x-y||^2 / 2))
 
     Arguments:
@@ -72,10 +76,11 @@ def compute_wass(X, Y, reg=0.01):
     return wasserstein_dist
 
 def transform_gpu(data, pca):
+    # set_trace()
     components = pca.components_
     mean = pca.mean_
 
-    data_gpu = torch.tensor(data, device='cuda')
+    data_gpu = torch.tensor(data, device='cuda', dtype=torch.float32)
     components_gpu = torch.tensor(components, device='cuda')
     mean_gpu = torch.tensor(mean, dtype=torch.float32).cuda()
 
@@ -106,3 +111,56 @@ def umap_embed(
     umap_gen = umap_embedding[num_samples:]
 
     return umap_gt, umap_gen
+
+def binned_KL(
+        bin_edges,
+        gt_data,
+        gen_data,
+        class_label
+    ):
+    # Compute the histogram for gt_data
+    gt_hist, _, _ = np.histogram2d(gt_data[:, 0], gt_data[:, 1], bins=bin_edges)
+    
+    # Compute the histogram for gen_data
+    gen_hist, _, _ = np.histogram2d(gen_data[:, 0], gen_data[:, 1], bins=bin_edges)
+    # Plot the heatmap for gt_hist
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.title(f"Ground Truth Histogram for class {class_label}")
+    plt.imshow(gt_hist.T, origin='lower', aspect='auto', interpolation='nearest')
+    plt.colorbar()
+    
+    # Plot the heatmap for gen_hist
+    plt.subplot(1, 2, 2)
+    plt.title(f"Generated Data Histogram for class {class_label}")
+    plt.imshow(gen_hist.T, origin='lower', aspect='auto', interpolation='nearest')
+    plt.colorbar()
+    
+    plt.savefig(f"histograms_{class_label}.png")
+    plt.close()
+    
+    # Add a small value to avoid division by zero and log of zero
+    epsilon = 1e-10
+    gt_hist += epsilon
+    gen_hist += epsilon
+    
+    # Normalize the histograms to get probability distributions
+    gt_hist /= np.sum(gt_hist)
+    gen_hist /= np.sum(gen_hist)
+    # set_trace()
+    # Compute the KL divergence
+    gt_hist_tensor = torch.tensor(gt_hist)
+    gen_hist_tensor = torch.tensor(gen_hist)
+    kl_divergence = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(probs=gt_hist_tensor.view(-1)),
+        torch.distributions.Categorical(probs=gen_hist_tensor.view(-1))
+    )
+    # set_trace()
+    return kl_divergence
+
+def umap_transform(data, umap_model):
+    # Transform the gen_data using the provided UMAP model
+    umap_embedding = umap_model.transform(data)
+    return umap_embedding
+
+    
