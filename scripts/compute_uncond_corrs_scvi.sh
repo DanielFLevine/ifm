@@ -20,8 +20,11 @@ cd /home/dfl32/project/ifm
 
 python compute_unconditional_corrs_scvi.py \
     --num_samples 20000 \
-    --num_repeats 5 \
+    --num_repeats 1 \
     --hvgs 50 \
     --n_cell_thresh 100 \
     --num_pca_dims 10 \
-    --umap_embed
+    --umap_embed \
+    --plot_umap \
+    --mmd_gamma 1.0 \
+    --wass_reg 0.01 \

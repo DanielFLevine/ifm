@@ -17,7 +17,7 @@ PERTURBATIONS = [
     'TNFa',
     'IFNb',
     'IFN-III',
-    'IFNb + TNFa'
+    'IFNb + TNFa' 
 ]
 
 def combo_split(combo_type: str):

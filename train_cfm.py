@@ -10,8 +10,10 @@ from datetime import datetime
 from itertools import cycle
 from tqdm import tqdm
 
+import datasets
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import ot
 import torch
 import torchdyn
@@ -108,20 +110,61 @@ def parse_arguments():
         type=str,
         default='default'
     )
+    parser.add_argument(
+        "--conditional_training",
+        action='store_true',
+        help="Enable conditional training"
+    )
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        choices=['chron', 'ct_pert'],
+        help="Type of conditional training split"
+    )
     return parser.parse_args()
 
+def load_pca_model(split_type):
+    pca_model_path = f'/home/dfl32/project/ifm/projections/{split_type}_pcadim1000_numsamples10000.pickle'
+    with open(pca_model_path, 'rb') as f:
+        pca_model = pickle.load(f)
+    return pca_model
+
+def load_conditional_datasets(split_type):
+    dataset_path = f'/home/dfl32/project/ifm/cinemaot_data/conditional_cinemaot/{split_type}_split'
+    train_ds = load_from_disk(os.path.join(dataset_path, 'train_ds'))
+    val_ds = load_from_disk(os.path.join(dataset_path, 'val_ds'))
+    return train_ds, val_ds
+
+def one_hot_encode_labels(dataset, label_columns):
+    # Convert Hugging Face Dataset to Pandas DataFrame if necessary
+    if isinstance(dataset, datasets.Dataset):
+        dataset = dataset.to_pandas()
+    for col in label_columns:
+        one_hot = pd.get_dummies(dataset[col], prefix=col)
+        dataset = pd.concat([dataset, one_hot], axis=1)
+    return dataset.drop(columns=label_columns)
 
 class CustomDataset(Dataset):
-    def __init__(self, hf_dataset):
-        self.dataset = hf_dataset
+    def __init__(self, hf_dataset, label_columns=None):
+        # Convert Hugging Face Dataset to Pandas DataFrame if necessary
+        if isinstance(hf_dataset, datasets.Dataset):
+            self.dataset = hf_dataset.to_pandas()
+        else:
+            self.dataset = hf_dataset
+        if label_columns:
+            self.dataset = one_hot_encode_labels(self.dataset, label_columns)
+        self.label_columns = label_columns
     
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Convert list of floats to tensor
-        return torch.tensor(self.dataset[idx]['expr'], dtype=torch.float32)
-
+        data = self.dataset.iloc[idx]
+        expression = torch.tensor(data['expression'], dtype=torch.float32)
+        if self.label_columns:
+            labels = torch.cat([torch.tensor(data.filter(like=col).values.astype(float), dtype=torch.float32) for col in self.label_columns])
+            return expression, labels
+        return expression, torch.tensor([])
 
 def sample_conditional_pt(x0, x1, t, sigma):
     """
@@ -213,14 +256,16 @@ def run_eval_loop(model, val_dataloader, device, args):
     model.eval()
     losses = []
     for batch in tqdm(val_dataloader):
-        x1 = batch.to(device)
+        x1, labels = batch
+        x1 = x1.to(device)
+        labels = labels.to(device)
         x0 = torch.normal(0.0, 1.0**0.5, size=x1.shape).to(device)
 
         t = torch.rand(x0.shape[0]).type_as(x0)
         xt = sample_conditional_pt(x0, x1, t, sigma=args.sigma)
         ut = compute_conditional_vector_field(x0, x1)
 
-        vt = model(torch.cat([xt, t[:, None]], dim=-1))
+        vt = model(torch.cat([xt, t[:, None], labels], dim=-1))
         loss = torch.mean((vt - ut) ** 2)
         losses.append(loss.item())
     eval_loss = sum(losses)/len(losses)
@@ -233,11 +278,35 @@ def main(args):
     logger.info(f"CFM Method {args.type}")
     assert args.type in ('default', 'ot', 'sb'), f"'--type' flag needs to be in ('default', 'ot', 'sb'). Currently {args.type}"
     now = datetime.now()
-    now = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
-    run_name = f"cfm-mlp-{args.type}-{now}"
+    now_str = datetime.strftime(now, "%Y-%m-%d_%H-%M-%S")
     device = torch.device("cuda")
 
-    model = MLP(dim=args.input_dim, w=args.mlp_width, time_varying=True).to(device)
+    if args.conditional_training:
+        pca_model = load_pca_model(args.split_type)
+        train_ds, val_ds = load_conditional_datasets(args.split_type)
+        label_columns = ['cell_type', 'perturbation', 'chronicity']
+        train_dataset = CustomDataset(train_ds, label_columns)
+        val_dataset = CustomDataset(val_ds, label_columns)
+        
+        # Calculate the total number of unique labels
+        num_unique_labels = sum(len(train_ds.unique(col)) for col in label_columns)
+        input_dim = args.input_dim + num_unique_labels
+        
+        model_save_dir = f"/home/dfl32/project/ifm/models/conditional_{args.split_type}_width{args.mlp_width}_{args.type}_{now_str}"
+    else:
+        dataset = load_from_disk(args.llm_dataset_path)
+        if args.train_dataset_size:
+            dataset = dataset.shuffle(seed=42)
+            dataset = dataset.select(range(args.train_dataset_size))
+        split_dataset = dataset.train_test_split(test_size=0.1, shuffle=True, seed=42)
+        train_dataset = CustomDataset(split_dataset['train'])
+        val_dataset = CustomDataset(split_dataset['test'].select(range(min(len(split_dataset['test']), args.eval_dataset_size))))
+        input_dim = args.input_dim
+        model_save_dir = f"/home/dfl32/project/ifm/models/non_conditional_width{args.mlp_width}_{args.type}_{now_str}"
+
+    run_name = model_save_dir.split("/")[-1]
+
+    model = MLP(dim=input_dim, out_dim=args.input_dim, w=args.mlp_width, time_varying=True).to(device)
     if args.checkpoint_step is not None:
         checkpoint_path = os.path.join(args.model_save_dir, f"checkpoint-{args.checkpoint_step}.pt")
         logger.info(f"Loading checkpoint {checkpoint_path}")
@@ -253,21 +322,6 @@ def main(args):
     wandb.watch(model, log="all", log_freq=10)
 
     optimizer = torch.optim.Adam(model.parameters())
-
-    dataset = load_from_disk(args.llm_dataset_path)
-    if args.train_dataset_size:
-        dataset = dataset.shuffle(seed=42)
-        dataset = dataset.select(range(args.train_dataset_size))
-
-    split_dataset = dataset.train_test_split(
-        test_size=0.1, 
-        shuffle=True, 
-        seed=42
-    )
-
-    train_dataset = CustomDataset(split_dataset['train'])
-    val_dataset = split_dataset['test']
-    val_dataset = CustomDataset(val_dataset.select(range(min(len(val_dataset), args.eval_dataset_size))))
 
     logger.info(train_dataset.dataset)
     logger.info(val_dataset.dataset)
@@ -291,18 +345,17 @@ def main(args):
         
         optimizer.zero_grad()
 
-        x1 = next(train_dataloader)
+        x1, labels = next(train_dataloader)
         x1 = x1.to(device)
+        labels = labels.to(device)
+        
+        logger.info(f"x1 dimensions: {x1.shape}")
 
         x0 = torch.normal(0.0, 1.0**0.5, size=x1.shape).to(device)
 
         t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
 
-        # t = torch.rand(x0.shape[0]).type_as(x0)
-        # xt = sample_conditional_pt(x0, x1, t, sigma=args.sigma)
-        # ut = compute_conditional_vector_field(x0, x1)
-
-        vt = model(torch.cat([xt, t[:, None]], dim=-1))
+        vt = model(torch.cat([xt, t[:, None], labels], dim=-1))
         loss = torch.mean((vt - ut) ** 2)
 
         loss.backward()
@@ -318,7 +371,7 @@ def main(args):
             logger.info(f"Loss = {loss.item()}, Eval Loss = {eval_loss}")
 
         if (step+1) % args.save_steps == 0:
-            save_model(model, step+1, run_name)
+            save_model(model, step+1, run_name, directory=model_save_dir)
 
 
         # if (k + 1) % 5000 == 0:

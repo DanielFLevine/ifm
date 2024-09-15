@@ -21,12 +21,12 @@ export TOKENIZERS_PARALLELISM=true
 export CP_DIR=/home/dfl32/scratch/training-runs/simple_ifm/diffusion-inputdim1000-2024-07-09_20-47-39
 export CHECKPOINT=2000000
 
-python compute_unconditional_corrs_diff.py \
+python compute_mmd_wass_diffusion.py \
     --cp_dir $CP_DIR \
     --checkpoint $CHECKPOINT \
     --num_samples 20000 \
-    --num_repeats 5 \
     --input_dim 1000 \
-    --hvgs 50 \
-    --num_pca_dims 10 \
-    --umap_embed
+    --mmd_gammas 1.0 2.0 \
+    --wass_regs 0.01 0.1 \
+    --umap_embed \
+    --num_pca_dims 10

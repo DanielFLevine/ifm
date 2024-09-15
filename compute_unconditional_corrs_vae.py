@@ -10,11 +10,6 @@ import torch
 from torch import nn
 from scipy.sparse import issparse
 from scipy.stats import pearsonr, spearmanr
-from torchdyn.core import NeuralODE
-
-from torchcfm.conditional_flow_matching import *
-from torchcfm.models.models import *
-from torchcfm.utils import *
 
 from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed, evaluate_model
 from utils.plots import plot_umap
@@ -22,12 +17,61 @@ from utils.plots import plot_umap
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class Encoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super(Encoder, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, latent_dim * 2)
+
+    def forward(self, x):
+        x = torch.relu(self.ln1(self.fc1(x)))
+        x = torch.relu(self.ln2(self.fc2(x)))
+        return self.fc3(x)
+
+class Decoder(nn.Module):
+    def __init__(self, latent_dim, hidden_dim, output_dim):
+        super(Decoder, self).__init__()
+        self.fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.ln1(self.fc1(x)))
+        return self.fc2(x)
+
+class VAE(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim):
+        super(VAE, self).__init__()
+        self.encoder = Encoder(input_dim, hidden_dim, latent_dim)
+        self.decoder = Decoder(latent_dim, hidden_dim, input_dim)
+
+    def encode(self, x):
+        h = self.encoder(x)
+        mu, logvar = torch.chunk(h, 2, dim=-1)
+        return mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--cp_dir",
         type=str,
-        default="/home/dfl32/scratch/training-runs/simple_ifm/cfm-mlp-2024-06-10_11-55-19"
+        default="/home/dfl32/scratch/training-runs/vae/vae-2024-06-10_11-55-19"
     )
     parser.add_argument(
         "--checkpoint",
@@ -68,9 +112,14 @@ def parse_arguments():
         default=768
     )
     parser.add_argument(
-        "--mlp_width",
+        "--hidden_dim",
         type=int,
         default=1024
+    )
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=128
     )
     parser.add_argument(
         "--num_pca_dims",
@@ -143,7 +192,6 @@ def z_score_norm(matrix):
     normalized_matrix = (matrix - means) / stds
     return normalized_matrix
 
-
 def main(args):
     # Prep data
 
@@ -181,47 +229,45 @@ def main(args):
 
     # Set loop parameters
     batch_size = 100
-    num_steps = num_samples//batch_size
+    num_steps = num_samples // batch_size
 
-    ### CFM ###
-    # Load CFM model
+    ### VAE ###
+    # Load VAE model
     model_path = os.path.join(args.cp_dir, f"checkpoint-{args.checkpoint}.pt")
     device = torch.device("cuda")
     input_dim = args.input_dim
-    mlp_width = args.mlp_width
+    hidden_dim = args.hidden_dim
+    latent_dim = args.latent_dim
 
-    model = MLP(
-        dim=input_dim,
-        w=mlp_width, 
-        time_varying=True
+    model = VAE(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        latent_dim=latent_dim
     ).to(device)
     print(model.load_state_dict(torch.load(model_path)))
     model.eval()
 
-    cfm_r2s = []
-    cfm_pears = []
-    cfm_spears = []
-    cfm_r2s_hvg = []
-    cfm_pears_hvg = []
-    cfm_spears_hvg = []
-    cfm_r2s_hvg_rare = []
-    cfm_pears_hvg_rare = []
-    cfm_spears_hvg_rare = []
+    vae_r2s = []
+    vae_pears = []
+    vae_spears = []
+    vae_r2s_hvg = []
+    vae_pears_hvg = []
+    vae_spears_hvg = []
+    vae_r2s_hvg_rare = []
+    vae_pears_hvg_rare = []
+    vae_spears_hvg_rare = []
     mmds = []
     wasss = []
     avg_entropies = []
     kl_divs = []
-    node = NeuralODE(torch_wrapper(model), solver="dopri5", sensitivity="adjoint", atol=1e-4, rtol=1e-4)
+
     for i in range(num_repeats):
         with torch.no_grad():
             cells = []
             for step in tqdm(range(num_steps)):
-                x0 = torch.normal(0.0, 1.0**0.5, size=(batch_size, input_dim)).to(device)
-                traj = node.trajectory(
-                            x0,
-                            t_span=torch.linspace(0, 1, 16),
-                        ) # shape num_time_points x batch_size x output_dim
-                cells.append(traj[-1, :, :].cpu().numpy())
+                z = torch.randn(batch_size, latent_dim).to(device)
+                recon_batch = model.decode(z)
+                cells.append(recon_batch.cpu().numpy())
             cells = np.concatenate(cells, axis=0)
 
         # Evaluate model
@@ -230,9 +276,8 @@ def main(args):
         avg_entropies.append(avg_entropy)
         kl_divs.append(kl_div)
 
-        logger.info("Inverse transforming CFM generated cells...")
+        logger.info("Inverse transforming VAE generated cells...")
         cells_ag = inverse_transform_gpu(cells, pca)
-        # cells_ag = pca.inverse_transform(cells)
         logger.info("Done.")
         sample_indices = np.random.choice(expression_data.shape[0], size=num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
@@ -247,16 +292,16 @@ def main(args):
                 plot_umap(
                     pca_sampled_expression_data,
                     cells,
-                    plot_name="cfm_sb_umap.png"
+                    plot_name="vae_umap.png"
                 )
 
         if args.umap_embed:
             pca_sampled_expression_data, cells = umap_embed(pca_sampled_expression_data, cells)
 
-        mmd = mmd_rbf(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims], gamma=args.mmd_gamma)
+        mmd = mmd_rbf(cells[:, :args.num_pca_dims], pca_sampled_expression_data[:, :args.num_pca_dims], gamma=args.mmd_gamma)
         mmds.append(mmd)
         logger.info(f"MMD: {mmd}")
-        wass = compute_wass(cells[:,:args.num_pca_dims], pca_sampled_expression_data[:,:args.num_pca_dims], reg=args.wass_reg)
+        wass = compute_wass(cells[:, :args.num_pca_dims], pca_sampled_expression_data[:, :args.num_pca_dims], reg=args.wass_reg)
         wasss.append(wass)
         logger.info(f"Wass: {wass}")
 
@@ -267,61 +312,61 @@ def main(args):
 
         # All genes
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag, sampled_expression_data)
-        logger.info(f"CFM R^2: {r2}")
-        logger.info(f"CFM Pearson correlation: {pearson_corr}")
-        logger.info(f"CFM Spearman correlation: {spearman_corr}")
-        cfm_r2s.append(r2)
-        cfm_pears.append(pearson_corr)
-        cfm_spears.append(spearman_corr)
+        logger.info(f"VAE R^2: {r2}")
+        logger.info(f"VAE Pearson correlation: {pearson_corr}")
+        logger.info(f"VAE Spearman correlation: {spearman_corr}")
+        vae_r2s.append(r2)
+        vae_pears.append(pearson_corr)
+        vae_spears.append(spearman_corr)
 
         # HVGS
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag[:, hvgs], sampled_expression_data[:, hvgs])
-        logger.info(f"CFM HVGS R^2: {r2}")
-        logger.info(f"CFM HVGS Pearson correlation: {pearson_corr}")
-        logger.info(f"CFM HVGS Spearman correlation: {spearman_corr}")
-        cfm_r2s_hvg.append(r2)
-        cfm_pears_hvg.append(pearson_corr)
-        cfm_spears_hvg.append(spearman_corr)
+        logger.info(f"VAE HVGS R^2: {r2}")
+        logger.info(f"VAE HVGS Pearson correlation: {pearson_corr}")
+        logger.info(f"VAE HVGS Spearman correlation: {spearman_corr}")
+        vae_r2s_hvg.append(r2)
+        vae_pears_hvg.append(pearson_corr)
+        vae_spears_hvg.append(spearman_corr)
 
         # Rare HVGS
         r2, pearson_corr, spearman_corr = compute_statistics(cells_ag[:, rare_hvgs], sampled_expression_data[:, rare_hvgs])
-        logger.info(f"CFM Rare HVGS R^2: {r2}")
-        logger.info(f"CFM Rare HVGS Pearson correlation: {pearson_corr}")
-        logger.info(f"CFM Rare HVGS Spearman correlation: {spearman_corr}")
-        cfm_r2s_hvg_rare.append(r2)
-        cfm_pears_hvg_rare.append(pearson_corr)
-        cfm_spears_hvg_rare.append(spearman_corr)
+        logger.info(f"VAE Rare HVGS R^2: {r2}")
+        logger.info(f"VAE Rare HVGS Pearson correlation: {pearson_corr}")
+        logger.info(f"VAE Rare HVGS Spearman correlation: {spearman_corr}")
+        vae_r2s_hvg_rare.append(r2)
+        vae_pears_hvg_rare.append(pearson_corr)
+        vae_spears_hvg_rare.append(spearman_corr)
 
-    cfm_r2s = np.array(cfm_r2s)
-    cfm_pears = np.array(cfm_pears)
-    cfm_spears = np.array(cfm_spears)
+    vae_r2s = np.array(vae_r2s)
+    vae_pears = np.array(vae_pears)
+    vae_spears = np.array(vae_spears)
     mmds = np.array(mmds)
     wasss = np.array(wasss)
-    avg_entropies = np.array(avg_entropies)
-    kl_divs = np.array(kl_divs)
     logger.info(f"MMD Mean {mmds.mean()} STD {mmds.std()}")
     logger.info(f"2-Wasserstein Mean {wasss.mean()} STD {wasss.std()}\n")
 
-    logger.info(f"CFM R^2 Mean {cfm_r2s.mean()} STD {cfm_r2s.std()}")
-    logger.info(f"CFM Pearson Mean {cfm_pears.mean()} STD {cfm_pears.std()}")
-    logger.info(f"CFM Spearman Mean {cfm_spears.mean()} STD {cfm_spears.std()}")
+    logger.info(f"VAE R^2 Mean {vae_r2s.mean()} STD {vae_r2s.std()}")
+    logger.info(f"VAE Pearson Mean {vae_pears.mean()} STD {vae_pears.std()}")
+    logger.info(f"VAE Spearman Mean {vae_spears.mean()} STD {vae_spears.std()}")
 
+    avg_entropies = np.array(avg_entropies)
+    kl_divs = np.array(kl_divs)
     logger.info(f"Average Entropy Mean {avg_entropies.mean()} STD {avg_entropies.std()}")
     logger.info(f"KL Divergence Mean {kl_divs.mean()} STD {kl_divs.std()}")
 
-    cfm_r2s_hvg = np.array(cfm_r2s_hvg)
-    cfm_pears_hvg = np.array(cfm_pears_hvg)
-    cfm_spears_hvg = np.array(cfm_spears_hvg)
-    logger.info(f"CFM HVGS R^2 Mean {cfm_r2s_hvg.mean()} STD {cfm_r2s_hvg.std()}")
-    logger.info(f"CFM HVGS Pearson Mean {cfm_pears_hvg.mean()} STD {cfm_pears_hvg.std()}")
-    logger.info(f"CFM HVGS Spearman Mean {cfm_spears_hvg.mean()} STD {cfm_spears_hvg.std()}")
+    vae_r2s_hvg = np.array(vae_r2s_hvg)
+    vae_pears_hvg = np.array(vae_pears_hvg)
+    vae_spears_hvg = np.array(vae_spears_hvg)
+    logger.info(f"VAE HVGS R^2 Mean {vae_r2s_hvg.mean()} STD {vae_r2s_hvg.std()}")
+    logger.info(f"VAE HVGS Pearson Mean {vae_pears_hvg.mean()} STD {vae_pears_hvg.std()}")
+    logger.info(f"VAE HVGS Spearman Mean {vae_spears_hvg.mean()} STD {vae_spears_hvg.std()}")
 
-    cfm_r2s_hvg_rare = np.array(cfm_r2s_hvg_rare)
-    cfm_pears_hvg_rare = np.array(cfm_pears_hvg_rare)
-    cfm_spears_hvg_rare = np.array(cfm_spears_hvg_rare)
-    logger.info(f"CFM Rare HVGS R^2 Mean {cfm_r2s_hvg_rare.mean()} STD {cfm_r2s_hvg_rare.std()}")
-    logger.info(f"CFM Rare HVGS Pearson Mean {cfm_pears_hvg_rare.mean()} STD {cfm_pears_hvg_rare.std()}")
-    logger.info(f"CFM Rare HVGS Spearman Mean {cfm_spears_hvg_rare.mean()} STD {cfm_spears_hvg_rare.std()}")
+    vae_r2s_hvg_rare = np.array(vae_r2s_hvg_rare)
+    vae_pears_hvg_rare = np.array(vae_pears_hvg_rare)
+    vae_spears_hvg_rare = np.array(vae_spears_hvg_rare)
+    logger.info(f"VAE Rare HVGS R^2 Mean {vae_r2s_hvg_rare.mean()} STD {vae_r2s_hvg_rare.std()}")
+    logger.info(f"VAE Rare HVGS Pearson Mean {vae_pears_hvg_rare.mean()} STD {vae_pears_hvg_rare.std()}")
+    logger.info(f"VAE Rare HVGS Spearman Mean {vae_spears_hvg_rare.mean()} STD {vae_spears_hvg_rare.std()}")
 
 if __name__ == "__main__":
     args = parse_arguments()

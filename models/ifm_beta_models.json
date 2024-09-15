@@ -1,0 +1,20 @@
+{
+    "0.0001": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.0001-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-03_10-31-47"
+    },
+    "0.001": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.001-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-03_10-31-46"
+    },
+    "0.01": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.01-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-02_12-06-40"
+    },
+    "0.1": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.1-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-02_12-06-40"
+    },
+    "1.0": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw1.0-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-02_10-50-45"
+    },
+    "10.0": {
+        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw10.0-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-09-03_10-31-46"
+    }
+}

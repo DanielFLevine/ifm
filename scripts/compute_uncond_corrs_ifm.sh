@@ -18,15 +18,18 @@ module load CUDA/12.1
 conda activate c2s2
 cd /home/dfl32/project/ifm
 export TOKENIZERS_PARALLELISM=true
-export SPACE_DIM=10
+export SPACE_DIM=1
 export TOTAL_SAMPLES=20000
 export POINTS_PER_SAMPLE=1
 
+# Generate the sequence of temperature values
+temps="1.7"
+
 python compute_unconditional_corrs_ifm.py \
-    --model_json_path /home/dfl32/project/ifm/models/ifm_big_models.json \
+    --model_json_path /home/dfl32/project/ifm/models/ifm_paths2.json \
     --num_samples $(($TOTAL_SAMPLES / $POINTS_PER_SAMPLE)) \
     --input_dim 1000 \
-    --temp 1.0 \
+    --temp $temps \
     --batch_size 100 \
     --num_repeats 5 \
     --hvgs 50 \
@@ -36,6 +39,9 @@ python compute_unconditional_corrs_ifm.py \
     --mlp_enc \
     --mlp_musig \
     --mmd_gamma 1.0 \
+    --wass_reg 0.01 \
     --num_pca_dims 10 \
     --umap_embed \
-    --points_per_sample $POINTS_PER_SAMPLE
+    --points_per_sample $POINTS_PER_SAMPLE \
+    --plot_umap \
+    --pretrained_weights \
