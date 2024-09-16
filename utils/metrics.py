@@ -158,9 +158,63 @@ def binned_KL(
     # set_trace()
     return kl_divergence
 
-def umap_transform(data, umap_model):
-    # Transform the gen_data using the provided UMAP model
-    umap_embedding = umap_model.transform(data)
-    return umap_embedding
+def inception_score(p_yx):
+    """
+    Compute the Inception Score for the generated data.
 
+    Parameters:
+    p_yx : torch tensor of shape [n_samples, n_classes)]
+        The predicted class probabilities for the generated data.
+        p(y|x), where y is the label, x is the data
+
+    Returns:
+    inception_score : float
+        The computed Inception Score.
+    """
+    py = p_yx.mean(dim=0) # marginal prob, p(y)
+    kl_div = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(probs=p_yx),
+        torch.distributions.Categorical(probs=py)
+    ).mean(dim=0)
     
+    inception_score = kl_div.exp()
+    return inception_score.item()
+
+def leiden_KL(gt_adata, gen_adata):
+    """
+    Compute the KL divergence between the ground truth and generated data using Leiden clustering.
+
+    Parameters:
+    gt_adata : AnnData
+        The ground truth annotated data matrix.
+    gen_adata : AnnData
+        The generated annotated data matrix.
+
+    Returns:
+    kl_divergence : torch.Tensor
+        The computed KL divergence between the ground truth and generated data.
+    """
+
+    # Check if the keys are in the adata obs
+    if 'leiden' not in gt_adata.obs or 'leiden_pred' not in gen_adata.obs:
+        raise KeyError("Make sure there is leiden and leiden_pred is gt and gen data respectively.")
+    
+    # Get the ground truth and predicted labels
+    gt_labels = gt_adata.obs['leiden'].astype(int).values
+    pred_labels = gen_adata.obs['leiden_pred'].astype(int).values
+
+    # We use the Leiden labels as bins directly
+    gt_hist = np.bincount(gt_labels) / len(gt_labels)
+    pred_hist = np.bincount(pred_labels, minlength=len(gt_hist)) / len(pred_labels)
+
+    gt_hist_tensor = torch.tensor(gt_hist)
+    pred_hist_tensor = torch.tensor(pred_hist)
+
+    # set_trace()
+
+    kl_divergence = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(probs=gt_hist_tensor.view(-1)),
+        torch.distributions.Categorical(probs=pred_hist_tensor.view(-1))
+    )
+    # set_trace()
+    return kl_divergence.item()

@@ -1,0 +1,39 @@
+{
+    "ct_pert": {
+        "1.0": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/ct_pert/trained_classifier_on_GT_Leiden_resol1.0_Test_Acc0.93.pth",
+            "output_dim": 41
+            },
+        "0.5": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/ct_pert/trained_classifier_on_GT_Leiden_resol0.5_Test_Acc0.94.pth",
+            "output_dim": 27
+            },
+        "0.3": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/ct_pert/trained_classifier_on_GT_Leiden_resol0.3_Test_Acc0.97.pth",
+            "output_dim": 19
+            }
+            ,
+        "0.1": {
+            "weights":"/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/ct_pert/trained_classifier_on_GT_Leiden_resol0.1_Test_Acc0.99.pth",
+            "output_dim": 11
+            }
+        },
+    "chron": {
+        "1.0": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/chron/trained_classifier_on_GT_Leiden_resol1.0_Test_Acc0.92.pth",
+            "output_dim": 48
+        },
+        "0.5": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/chron/trained_classifier_on_GT_Leiden_resol0.5_Test_Acc0.96.pth",
+            "output_dim": 31
+        },
+        "0.3": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/chron/trained_classifier_on_GT_Leiden_resol0.3_Test_Acc0.97.pth",
+            "output_dim": 23
+            },
+        "0.1": {
+            "weights": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/leiden_classifier_model/chron/trained_classifier_on_GT_Leiden_resol0.1_Test_Acc0.98.pth",
+            "output_dim": 13
+        }
+    }
+}

@@ -20,6 +20,7 @@ import anndata as ad
 from ipdb import set_trace
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+import pandas as pd
 
 from utils.modules import CustomVAEDecoder, TwoLayerMLP
 from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed
@@ -242,9 +243,9 @@ def build_and_tokenize_prefixes(inputs, prompts, tokenizer, max_length=1024, dev
 def main(args):
     # Prep data
     dataset_path = "/home/dfl32/project/ifm/cinemaot_data/conditional_cinemaot/ct_pert_split"
-    test_dataset = load_from_disk(os.path.join(dataset_path, 'test_ds'))
+    test_dataset = load_from_disk(os.path.join(dataset_path, 'test_ds')) # expression matrix shape (5902, 1000)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size)
-    
+    # set_trace()
     
     expression_matrix = np.array(test_dataset['expression'])
     adata = ad.AnnData(X=expression_matrix)
@@ -337,6 +338,10 @@ def main(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    experiment_directory = os.path.join("/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/inference_results", f"pretrained-{args.pretrained_weights}_space{args.space_dim}", f"temperature-{args.temp}")
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_directory = os.path.join(experiment_directory, f"run_{current_time}")
+    os.makedirs(run_directory, exist_ok=True)
     
     if args.idfm:
         euler_step_size = 1/(time_points-1)
@@ -349,71 +354,72 @@ def main(args):
                 "chronicity": []
             }
             for batch in tqdm(test_dataloader): # change to data loader
-                # Generate a batch of cells
-                
                 # Prepare labels
                 umap_labels["perturbation"].extend(batch["perturbation"])
                 umap_labels["cell_type"].extend(batch["cell_type"])
                 umap_labels["chronicity"].extend(batch["chronicity"])
                 
-            #     prefix_tokens = build_and_tokenize_prefixes(batch, prompts, tokenizer)
-            #     prefix_input_ids = prefix_tokens['prefix_input_ids']
-            #     prefix_tokens_attention_mask = prefix_tokens['prefix_attention_mask']
-            #     prefix_length = prefix_input_ids.shape[1]
-            #     batch_size = prefix_input_ids.shape[0]
-            #     paths = torch.normal(0.0, 1.0, size=(batch_size, args.points_per_sample, input_dim)).to(device)
-            #     prefix_emb = model.gpt_neox.embed_in(prefix_input_ids)
+                prefix_tokens = build_and_tokenize_prefixes(batch, prompts, tokenizer)
+                prefix_input_ids = prefix_tokens['prefix_input_ids']
+                prefix_tokens_attention_mask = prefix_tokens['prefix_attention_mask']
+                prefix_length = prefix_input_ids.shape[1]
+                batch_size = prefix_input_ids.shape[0]
+                paths = torch.normal(0.0, 1.0, size=(batch_size, args.points_per_sample, input_dim)).to(device)
+                prefix_emb = model.gpt_neox.embed_in(prefix_input_ids)
                 
-            #     # Autoregressive generation
-            #     for _ in range(time_points-1):
-            #         path_emb = model.cell_enc(paths)
-            #         # Reshape for spatial integration
-            #         batch_size, seq_len, feature = path_emb.shape
-            #         path_emb = path_emb.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
-            #         path_emb = path_emb.view(batch_size, seq_len* args.space_dim, feature // args.space_dim)
-            #         # set_trace()
-            #         # print(prefix_emb.shape, path_emb.shape)
-            #         input_emb = torch.concat([prefix_emb, path_emb], dim=1)
-            #         attention_mask = torch.cat(
-            #                 [
-            #                     prefix_tokens_attention_mask,
-            #                     torch.ones((path_emb.shape[0], path_emb.shape[1]), dtype=torch.int32).to(model.device)
-            #                 ], 
-            #                 dim=1
-            #         )
+                # Autoregressive generation
+                for _ in range(time_points-1):
+                    path_emb = model.cell_enc(paths)
+                    # Reshape for spatial integration
+                    batch_size, seq_len, feature = path_emb.shape
+                    path_emb = path_emb.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
+                    path_emb = path_emb.view(batch_size, seq_len* args.space_dim, feature // args.space_dim)
+                    # set_trace()
+                    # print(prefix_emb.shape, path_emb.shape)
+                    input_emb = torch.concat([prefix_emb, path_emb], dim=1)
+                    attention_mask = torch.cat(
+                            [
+                                prefix_tokens_attention_mask,
+                                torch.ones((path_emb.shape[0], path_emb.shape[1]), dtype=torch.int32).to(model.device)
+                            ], 
+                            dim=1
+                    )
                     
-            #         outputs = model.gpt_neox(inputs_embeds=input_emb, attention_mask=attention_mask).last_hidden_state
-            #         outputs = outputs[:, prefix_length:, ...]
+                    outputs = model.gpt_neox(inputs_embeds=input_emb, attention_mask=attention_mask).last_hidden_state
+                    outputs = outputs[:, prefix_length:, ...]
                     
-            #         if not args.reshape_postvae:
-            #             outputs = outputs.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
-            #             outputs = outputs.view(batch_size, seq_len, feature)
+                    if not args.reshape_postvae:
+                        outputs = outputs.view(batch_size, seq_len, args.space_dim, feature // args.space_dim)
+                        outputs = outputs.view(batch_size, seq_len, feature)
                     
-            #         outputs, _, _ = model.cell_dec(outputs, temperature=args.temp)
-            #         last_outputs = outputs[:, -args.points_per_sample:, :]
+                    outputs, _, _ = model.cell_dec(outputs, temperature=args.temp)
+                    last_outputs = outputs[:, -args.points_per_sample:, :]
                     
-            #         if args.idfm:
-            #             last_outputs = paths[:, -args.points_per_sample:, :] + (euler_step_size * last_outputs)
+                    if args.idfm:
+                        last_outputs = paths[:, -args.points_per_sample:, :] + (euler_step_size * last_outputs)
                     
-            #         paths = torch.concat([paths, last_outputs], axis=1)
+                    paths = torch.concat([paths, last_outputs], axis=1)
                     
                 
-            #     batch_size, _, feature_dim = outputs.shape
-            #     cells.append(outputs[:, -args.points_per_sample:, :].reshape(args.points_per_sample*batch_size, feature_dim).detach().cpu().numpy())
-            # cells = np.concatenate(cells, axis=0)
+                batch_size, _, feature_dim = outputs.shape
+                cells.append(outputs[:, -args.points_per_sample:, :].reshape(args.points_per_sample*batch_size, feature_dim).detach().cpu().numpy())
+            cells = np.concatenate(cells, axis=0)
         # set_trace()
-        cells = np.load("generated_cells.npy")
+        logger.info("Save generated cells...")
+        np.save(os.path.join(run_directory, "generated_cells.npy"), cells) 
+        logger.info("Done")
+
         logger.info("Inverse transforming IFM generated cells...")
         cells_ag = inverse_transform_gpu(cells, pca)
         # set_trace()
         # cells_ag = pca.inverse_transform(cells)
         logger.info("Done.")
         
-        sample_indices = np.random.choice(expression_data.shape[0], size=num_samples*args.points_per_sample, replace=False)
+        # sample_indices = np.random.choice(expression_data.shape[0], size=num_samples*args.points_per_sample, replace=False)
         # sampled_expression_data = expression_data[sample_indices]
         # BUG: WARNING: the following may be non-sense
         logger.info("Inverse transforming GT cells...")
-        pca_sampled_expression_data = expression_data[sample_indices]
+        pca_sampled_expression_data = expression_data #[sample_indices]
         sampled_expression_data = inverse_transform_gpu(pca_sampled_expression_data, pca)
         logger.info("Done.")
         # set_trace()
@@ -421,17 +427,18 @@ def main(args):
         # pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
         # logger.info("Done.")
 
-        current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        umap_directory = os.path.join("/home/sh2748/ifm/umaps", current_time)
+        
+        umap_directory = os.path.join(run_directory, "UMAPs")
         os.makedirs(umap_directory, exist_ok=True)
-        umap_name = os.path.join
+        
         if args.plot_umap:
             if i == 0:
                 logger.info("Plotting UMAP...")
                 plot_umap(
                     pca_sampled_expression_data,
                     cells,
-                    plot_name=f"{current_time}/calmflow_pp4_space{args.space_dim}",
+                    save_dir=umap_directory,
+                    plot_name=f"calmflow_pp4_space{args.space_dim}",
                     labels=umap_labels
                 )
 
@@ -505,6 +512,17 @@ def main(args):
     # logger.info(f"IFM Rare HVGS R^2 Mean {ifm_r2s_hvg_rare.mean()} STD {ifm_r2s_hvg_rare.std()}")
     # logger.info(f"IFM Rare HVGS Pearson Mean {ifm_pears_hvg_rare.mean()} STD {ifm_pears_hvg_rare.std()}")
     # logger.info(f"IFM Rare HVGS Spearman Mean {ifm_spears_hvg_rare.mean()} STD {ifm_spears_hvg_rare.std()}")
+
+    metrics_data = {
+        "IFM R^2": ifm_r2s,
+        "IFM Pearson": ifm_pears,
+        "IFM Spearman": ifm_spears,
+        "MMD": mmds, 
+        "Wass": wasss
+    }
+    
+    metrics_df = pd.DataFrame(metrics_data)
+    metrics_df.to_csv(os.path.join(run_directory, "metrics.csv"), index=False)
 
 if __name__ == "__main__":
     args = parse_arguments()

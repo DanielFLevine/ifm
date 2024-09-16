@@ -1,12 +1,17 @@
 {
-    "pretrained_weights": {
-        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space1-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_10-37-34",
-        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_11-32-37",
-        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space10-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_12-07-17"
+    "ct_pert": {
+        "pretrained_weights": {
+                "1": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.3-EleutherAI/pythia-160m-space1-pps1-splitct_pert-ifm-2024-09-05_00-36-46",
+                "5": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.3-EleutherAI/pythia-160m-space5-pps1-splitct_pert-ifm-2024-09-05_02-55-44",
+                "10": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.11-EleutherAI/pythia-160m-space10-pps1-splitct_pert-ifm-2024-09-09_19-56-46/ct_pert"
+            }
     },
-    "random_weights": {
-        "1": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space1-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_14-29-56",
-        "5": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_14-29-56",
-        "10": "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space10-pps1-preweightsFalse-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_15-09-48"
+    "chron": {
+        "pretrained_weights": {
+                "1": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.3-EleutherAI/pythia-160m-space1-pps1-splitchron-ifm-2024-09-05_19-54-39/chron",
+                "5": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.3-EleutherAI/pythia-160m-space5-pps1-splitchron-ifm-2024-09-05_14-58-22/chron",
+                "10": "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/training_runs/conditional_gen-klw0.3-EleutherAI/pythia-160m-space10-pps1-splitchron-ifm-2024-09-05_14-11-50/chron"
+            }
     }
+    
 }

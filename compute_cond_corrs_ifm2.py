@@ -23,10 +23,11 @@ from transformers import AutoTokenizer
 import pandas as pd
 
 from utils.modules import CustomVAEDecoder, TwoLayerMLP
-from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed, binned_KL, umap_transform
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed, binned_KL, inception_score, leiden_KL
 from utils.plots import plot_umap
 from utils.adata_dataset import TestLabelDataset
 from utils.data_utils import drop_rare_classes, get_control_adata
+from utils.leiden_classifier import MLPClassifier
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -169,6 +170,23 @@ def parse_arguments():
         default="ct_pert",
         help="Which train/test split to use for conditional generation. Valid values are 'ct_pert' or 'chron'"
     )
+    parser.add_argument(
+        "--compute_metrics",
+        action="store_true",
+        help="Flag to indicate whether to compute metrics"
+    )
+    parser.add_argument(
+        "--leiden_resol",
+        type=float,
+        default=1.0,
+        help="Resolution parameter for Leiden clustering"
+    )
+    parser.add_argument(
+        "--leiden_classifier_path",
+        type=str,
+        default="/home/sh2748/ifm/models/leiden_classifier.json",
+        help="Path to the JSON file containing paths to the trained Leiden classifier models"
+    )
     return parser.parse_args()
 
 def multipoint_reshape(X, points_per_sample):
@@ -264,6 +282,14 @@ def log_stats(logger, repeat, class_label, r2_prefix, r2, pearson_corr, spearman
 
 
 def main(args):
+    # Create save directories
+    experiment_directory = os.path.join("/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/inference_results", f"{args.pert_split}_split",f"pretrained-{args.pretrained_weights}_space{args.space_dim}", f"temperature-{args.temp}")
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_directory = os.path.join(experiment_directory, f"run_{current_time}")
+    os.makedirs(run_directory, exist_ok=True)
+    logger.info(f"Saved to: {run_directory}")
+    logger.info(f"Copy the above directory to inference_report.ipynb to see inference results!")
+
     # Prep data
     # The adata is already preprocessed
     adata = sc.read_h5ad(f"/home/dfl32/project/ifm/cinemaot_data/conditional_cinemaot/{args.pert_split}_split/test_data_{args.pert_split}_split.h5ad") # shape (5902, 21710)
@@ -333,12 +359,7 @@ def main(args):
     logger.info(model.load_state_dict(pt_state_dict))
     model.eval()
 
-    # Create save directories
-    experiment_directory = os.path.join("/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/inference_results", f"{args.pert_split}_split",f"pretrained-{args.pretrained_weights}_space{args.space_dim}", f"temperature-{args.temp}")
-    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_directory = os.path.join(experiment_directory, f"run_{current_time}")
-    os.makedirs(run_directory, exist_ok=True)
-
+    
     # Load labels
     test_dataset = TestLabelDataset(adata)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
@@ -367,6 +388,9 @@ def main(args):
     
     mmds = []
     wasss = []
+    leiden_kls = []
+    incep_scores = []
+    overall_binned_kls = []
     time_points = args.time_points
 
     # Load prompts and the tokenizer
@@ -439,23 +463,32 @@ def main(args):
                 batch_size, _, feature_dim = outputs.shape
                 cells.append(outputs[:, -args.points_per_sample:, :].reshape(args.points_per_sample*batch_size, feature_dim).detach().cpu().numpy())
             
-            cells = np.concatenate(cells, axis=0)
+            cells = np.concatenate(cells, axis=0) # shape (n_cells, 1000)
         
-        logger.info("Save generated cells...")
-        np.save(os.path.join(run_directory, "generated_cells.npy"), cells) 
+        logger.info("Save generated cells as anndata...")
+        generated_adata = ad.AnnData(X=cells) # Already PCA'd
+        generated_adata.obs["perturbation"] = umap_labels["perturbation"]
+        generated_adata.obs["cell_type"] = umap_labels["cell_type"]
+        generated_adata.obs["chronicity"] = umap_labels["chronicity"]
+        generated_adata.obs["combined_labels"] = umap_labels["combined_labels"]
+        generated_adata_save_path = os.path.join(run_directory, "generated_cells_pca.h5ad")
+        generated_adata.write(generated_adata_save_path)
+        logger.info(f"Saved to {generated_adata_save_path}")
+        
         logger.info("Done")
 
         logger.info("PCAing ground truth data...")
         pca_expression_data = transform_gpu(expression_data, pca)
         logger.info("Done.")
-
+        
         logger.info("Inverse transforming IFM generated cells...")
         cells_ag = inverse_transform_gpu(cells, pca)
         logger.info("Done.")
         
+        umap_directory = os.path.join(run_directory, "UMAPs")
+        os.makedirs(umap_directory, exist_ok=True)
         if args.plot_umap:
-            umap_directory = os.path.join(run_directory, "UMAPs")
-            os.makedirs(umap_directory, exist_ok=True)
+            
             if i == 0:
                 logger.info("Plotting UMAP...")
                 plot_umap(
@@ -466,127 +499,187 @@ def main(args):
                     labels=umap_labels
                 )
 
-        
-        # Compute MMD and Wass on PCA GT data and PCA gen data
-        mmd = mmd_rbf(cells[:,:args.num_pca_dims], pca_expression_data[:,:args.num_pca_dims])
-        mmds.append(mmd)
-        logger.info(f"MMD: {mmd}")
-        wass = compute_wass(cells[:,:args.num_pca_dims], pca_expression_data[:,:args.num_pca_dims])
-        wasss.append(wass)
-        logger.info(f"Wass: {wass}")
-        
-        if args.z_score:
-            logger.info("Normalizing genes by Z-score...")
-            cells_ag = z_score_norm(cells_ag)
-            expression_data = z_score_norm(expression_data)
+        if not args.compute_metrics:
+            logger.info("NOT COMPUTING ANY METRICS!!")
+            break
+        else:
+            logger.info("Computing metrics...")
 
-        
-        logger.info("Computing metrics...")
-        # Prepare for KL
-        # Make directory, load UMAP model, define bins
-        umap_model_dir = "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/umap_models"
-        umap_model_path = os.path.join(umap_model_dir, f"{args.pert_split}_split_umap_model.pkl")
-        with open(umap_model_path, 'rb') as f:
-            logger.info(f"Loading UMAP model from {umap_model_path}...")
-            umap_model = pickle.load(f)
-            logger.info("Done.")
-        logger.info("Transforming PCA expression data and PCA IFM data to 2D UMAP...")
-        umap_pca_expression_data = umap_transform(pca_expression_data, umap_model)
-        umap_cells = umap_transform(cells, umap_model)
-        logger.info("Done.")
-        set_trace()
-        assert umap_pca_expression_data.shape[1] == 2, f'Want 2D UMAP but got {umap_pca_expression_data.shape[1]}'
-        bin_edges = [
-            np.linspace(np.min(umap_pca_expression_data[:, i]), np.max(umap_pca_expression_data[:, i]), args.kl_bins + 1)
-            for i in range(umap_pca_expression_data.shape[1])
-        ]
-        logger.info(f"Created bins whose dimension 0 from {bin_edges[0][0]} to {bin_edges[0][-1]} and dimension 1 from {bin_edges[1][0]} to {bin_edges[1][-1]}..")
-        
-        # Compute metrics per class
-        for class_label in label_combinations:
-            # Get data for this class
-            class_indices = test_dataset.get_indices_of_class(class_label)
-            class_cells_ag = cells_ag[class_indices]
-            class_expression_data = expression_data[class_indices] # or adata[adata.obs["combined_labels"]==class_label].X, equivalent
-            class_umap_pca_expression_data = umap_pca_expression_data[class_indices]
-            class_umap_cells = umap_cells[class_indices]
-
-            # Find the control cells of the same cell type and chronicity
-            # Subtract the mean control cell from the cells to get delta
-            control_adata = get_control_adata(train_adata, class_label)
-            control_mean = np.mean(control_adata.X, axis=0) # shape (21710,)
-            class_delta_cells_ag = class_cells_ag - control_mean
-            class_delta_expression_data = class_expression_data - control_mean
-
-            logger.info(f"Class {class_label} has {len(class_indices)} data points.")
+            # Compute metrics that are not per-class
+            logger.info("Computing RBF MMD on PCA'd data...")
+            mmd = mmd_rbf(cells[:,:args.num_pca_dims], pca_expression_data[:,:args.num_pca_dims])
+            mmds.append(mmd)
+            logger.info(f"MMD: {mmd}")
+            logger.info("Computing 2-Wass on PCA'd data...")
+            wass = compute_wass(cells[:,:args.num_pca_dims], pca_expression_data[:,:args.num_pca_dims])
+            wasss.append(wass)
+            logger.info(f"Wass: {wass}")
             
-            # IFM
-            r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag, class_expression_data)
-            delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag, class_delta_expression_data)
-            kl_divergence = binned_KL(bin_edges = bin_edges, gt_data=class_umap_pca_expression_data, gen_data=class_umap_cells, class_label=class_label)
-            logger.info(f"Repeat {str(i).ljust(5)} "
-                f"Class {str(class_label).ljust(15)} "
-                f"IFM R^2: {str(f'{r2:.6f}').ljust(10)} "
-                f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
-                f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)}"
-                f"Delta IFM R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
-                f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
-                f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)}"
-                f"Binned 2D UMAP KL Divergence: {str(f'{kl_divergence:.6f}').ljust(10)} "
-                )
-            ifm_r2s[class_label].append(r2)
-            ifm_pears[class_label].append(pearson_corr)
-            ifm_spears[class_label].append(spearman_corr)
-            ifm_r2s_delta[class_label].append(delta_r2)
-            ifm_pears_delta[class_label].append(delta_pearson_corr)
-            ifm_spears_delta[class_label].append(delta_spearman_corr)
-            binned_kls[class_label].append(kl_divergence)
+            if args.z_score:
+                logger.info("Normalizing genes by Z-score...")
+                cells_ag = z_score_norm(cells_ag)
+                expression_data = z_score_norm(expression_data)
+            
+            # Load UMAP model that is trained on PCA GT data
+            umap_model_dir = "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/umap_models"
+            umap_model_path = os.path.join(umap_model_dir, f"{args.pert_split}_split_umap_model.pkl")
+            with open(umap_model_path, 'rb') as f:
+                logger.info(f"Loading UMAP model from {umap_model_path}...")
+                umap_model = pickle.load(f)
+                logger.info("Done.")
+            
+            logger.info("Transforming PCA expression data and PCA IFM data to 2D UMAP...")
+            umap_pca_expression_data = umap_model.transform(pca_expression_data)
+            umap_cells = umap_model.transform(cells)
+            logger.info("Done.")
 
-            # HVGS
-            r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag[:, hvgs], class_expression_data[:, hvgs])
-            delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag[:, hvgs], class_delta_expression_data[:, hvgs])
-            logger.info(f"Repeat {str(i).ljust(5)} "
-                f"Class {str(class_label).ljust(15)} "
-                f"IFM HVGS R^2: {str(f'{r2:.6f}').ljust(10)} "
-                f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
-                f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)} "
-                f"Delta IFM HVGS R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
-                f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
-                f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)} ")
-            ifm_r2s_hvg[class_label].append(r2)
-            ifm_pears_hvg[class_label].append(pearson_corr)
-            ifm_spears_hvg[class_label].append(spearman_corr)
-            ifm_r2s_hvg_delta[class_label].append(delta_r2)
-            ifm_pears_hvg_delta[class_label].append(delta_pearson_corr)
-            ifm_spears_hvg_delta[class_label].append(delta_spearman_corr)
+            generated_adata.obsm["X_umap"] = umap_cells # checked
+            # Leiden clustering on PCA GT data
+            
+            with open(args.leiden_classifier_path, "r") as f:
+                leiden_classifiers = json.load(f)
+            leiden_classifier_weights = leiden_classifiers[args.pert_split][str(args.leiden_resol)]["weights"]
+            num_leiden_classes =  leiden_classifiers[args.pert_split][str(args.leiden_resol)]["output_dim"]
+            logger.info(f"Load Leiden classifier MLP from CHECKPOINT PATH: {leiden_classifier_weights}...")
+            leiden_classifier_model = MLPClassifier(output_dim=num_leiden_classes)
+            leiden_classifier_model.load_state_dict(torch.load(leiden_classifier_weights))
+            leiden_classifier_model = leiden_classifier_model.to('cuda')
+            leiden_classifier_model.eval()
+            logger.info("Done.")
 
-            # Rare HVGS
-            r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag[:, rare_hvgs], class_expression_data[:, rare_hvgs])
-            delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag[:, rare_hvgs], class_delta_expression_data[:, rare_hvgs])
-            logger.info(f"Repeat {str(i).ljust(5)} "
-                f"Class {str(class_label).ljust(15)} "
-                f"IFM Rare HVGS R^2: {str(f'{r2:.6f}').ljust(10)} "
-                f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
-                f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)} "
-                f"Delta IFM Rare HVGS R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
-                f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
-                f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)} ")
-            ifm_r2s_hvg_rare[class_label].append(r2)
-            ifm_pears_hvg_rare[class_label].append(pearson_corr)
-            ifm_spears_hvg_rare[class_label].append(spearman_corr)
-            ifm_r2s_hvg_rare_delta[class_label].append(delta_r2)
-            ifm_pears_hvg_rare_delta[class_label].append(delta_pearson_corr)
-            ifm_spears_hvg_rare_delta[class_label].append(delta_spearman_corr)
+            logger.info("Predicting Leiden labels on generated cells...")
+            X_gen = generated_adata.obsm['X_umap']
+            X_gen_tensor = torch.tensor(X_gen, dtype=torch.float32, device="cuda")
+            with torch.no_grad():
+                outputs = leiden_classifier_model(X_gen_tensor)
+                _, y_gen_pred = torch.max(outputs, 1)
+            generated_adata.obs['leiden_pred'] = y_gen_pred.cpu().numpy().astype(str)
+            
+            logger.info("Plotting UMAP with predicted Leiden clusters for generated data...")
+            if i == 0:
+                sc.settings.figdir = umap_directory
+                sc.pl.umap(generated_adata, color='leiden_pred', title='Generated Cells UMAP: Predicted Leiden Clusters', save='gen_data_Leiden_pred.png')
+                sc.pl.umap(generated_adata, color='combined_labels', title='Generated Cells UMAP: Combo', save='gen_data_combined_labels.png')
+            #TODO: make this line look better
+            pca_gt_adata = sc.read_h5ad(f"/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/test_data_with_leiden_labels/{args.pert_split}/resol{args.leiden_resol}/test_adata_with_Leiden_resol{args.leiden_resol}_cluster{num_leiden_classes}.h5ad")
+            if i == 0:
+                sc.pl.umap(pca_gt_adata, color='leiden', title='PCA GT Data UMAP: Leiden Clusters', save='pca_gt_data_Leiden.png')
+                sc.pl.umap(pca_gt_adata, color='combined_labels', title='PCA GT Data UMAP: Combo', save='pca_gt_data_combined_labels.png')
+            
+            # 4. compute inception score
+            predictions = leiden_classifier_model(X_gen_tensor).softmax(dim=1).detach()
+            incep_score = inception_score(predictions)
+            logger.info(f"Inception Score: {incep_score}")
+            # 5. compute leiden KL
+            leiden_kl_diveregnce = leiden_KL(pca_gt_adata, generated_adata)
+            logger.info(f"Leiden KL Divergence: {leiden_kl_diveregnce}")
+            incep_scores.append(incep_score)
+            leiden_kls.append(leiden_kl_diveregnce)
+            
+            
+            assert umap_pca_expression_data.shape[1] == 2, f'Want 2D UMAP but got {umap_pca_expression_data.shape[1]}'
+            bin_edges = [
+                np.linspace(np.min(umap_pca_expression_data[:, i]), np.max(umap_pca_expression_data[:, i]), args.kl_bins + 1)
+                for i in range(umap_pca_expression_data.shape[1])
+            ]
+            logger.info(f"Created bins whose dimension 0 from {bin_edges[0][0]} to {bin_edges[0][-1]} and dimension 1 from {bin_edges[1][0]} to {bin_edges[1][-1]}..")
+            
+            overall_binned_kl = binned_KL(bin_edges = bin_edges, gt_data=umap_pca_expression_data, gen_data=umap_cells, class_label="all")
+            overall_binned_kls.append(overall_binned_kl)
+            logger.info(f"Binned KL Divergence on all data: {overall_binned_kl}")
+            
+            # Compute metrics per class
+            for class_label in label_combinations:
+                # Get data for this class
+                class_indices = test_dataset.get_indices_of_class(class_label)
+                class_cells_ag = cells_ag[class_indices]
+                class_expression_data = expression_data[class_indices] # or adata[adata.obs["combined_labels"]==class_label].X, equivalent
+                class_umap_pca_expression_data = umap_pca_expression_data[class_indices]
+                class_umap_cells = umap_cells[class_indices]
 
-    logger.info(f"\nTemperature {args.temp}")
+                # Find the control cells of the same cell type and chronicity
+                # Subtract the mean control cell from the cells to get delta
+                control_adata = get_control_adata(train_adata, class_label)
+                control_mean = np.mean(control_adata.X, axis=0) # shape (21710,)
+                class_delta_cells_ag = class_cells_ag - control_mean
+                class_delta_expression_data = class_expression_data - control_mean
+
+                logger.info(f"Class {class_label} has {len(class_indices)} data points.")
+                
+                # IFM
+                r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag, class_expression_data)
+                delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag, class_delta_expression_data)
+                kl_divergence = binned_KL(bin_edges = bin_edges, gt_data=class_umap_pca_expression_data, gen_data=class_umap_cells, class_label=class_label)
+                logger.info(f"Repeat {str(i).ljust(5)} "
+                    f"Class {str(class_label).ljust(15)} "
+                    f"IFM R^2: {str(f'{r2:.6f}').ljust(10)} "
+                    f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
+                    f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)}"
+                    f"Delta IFM R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
+                    f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
+                    f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)}"
+                    f"Binned 2D UMAP KL Divergence: {str(f'{kl_divergence:.6f}').ljust(10)} "
+                    )
+                # set_trace()
+                ifm_r2s[class_label].append(r2)
+                ifm_pears[class_label].append(pearson_corr)
+                ifm_spears[class_label].append(spearman_corr)
+                ifm_r2s_delta[class_label].append(delta_r2)
+                ifm_pears_delta[class_label].append(delta_pearson_corr)
+                ifm_spears_delta[class_label].append(delta_spearman_corr)
+                binned_kls[class_label].append(kl_divergence)
+
+                # HVGS
+                r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag[:, hvgs], class_expression_data[:, hvgs])
+                delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag[:, hvgs], class_delta_expression_data[:, hvgs])
+                logger.info(f"Repeat {str(i).ljust(5)} "
+                    f"Class {str(class_label).ljust(15)} "
+                    f"IFM HVGS R^2: {str(f'{r2:.6f}').ljust(10)} "
+                    f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
+                    f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)} "
+                    f"Delta IFM HVGS R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
+                    f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
+                    f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)} ")
+                ifm_r2s_hvg[class_label].append(r2)
+                ifm_pears_hvg[class_label].append(pearson_corr)
+                ifm_spears_hvg[class_label].append(spearman_corr)
+                ifm_r2s_hvg_delta[class_label].append(delta_r2)
+                ifm_pears_hvg_delta[class_label].append(delta_pearson_corr)
+                ifm_spears_hvg_delta[class_label].append(delta_spearman_corr)
+
+                # Rare HVGS
+                r2, pearson_corr, spearman_corr = compute_statistics(class_cells_ag[:, rare_hvgs], class_expression_data[:, rare_hvgs])
+                delta_r2, delta_pearson_corr, delta_spearman_corr = compute_statistics(class_delta_cells_ag[:, rare_hvgs], class_delta_expression_data[:, rare_hvgs])
+                logger.info(f"Repeat {str(i).ljust(5)} "
+                    f"Class {str(class_label).ljust(15)} "
+                    f"IFM Rare HVGS R^2: {str(f'{r2:.6f}').ljust(10)} "
+                    f"Pearson correlation: {str(f'{pearson_corr:.6f}').ljust(10)} "
+                    f"Spearman correlation: {str(f'{spearman_corr:.6f}').ljust(10)} "
+                    f"Delta IFM Rare HVGS R^2: {str(f'{delta_r2:.6f}').ljust(10)} "
+                    f"Delta Pearson correlation: {str(f'{delta_pearson_corr:.6f}').ljust(10)} "
+                    f"Delta Spearman correlation: {str(f'{delta_spearman_corr:.6f}').ljust(10)} ")
+                ifm_r2s_hvg_rare[class_label].append(r2)
+                ifm_pears_hvg_rare[class_label].append(pearson_corr)
+                ifm_spears_hvg_rare[class_label].append(spearman_corr)
+                ifm_r2s_hvg_rare_delta[class_label].append(delta_r2)
+                ifm_pears_hvg_rare_delta[class_label].append(delta_pearson_corr)
+                ifm_spears_hvg_rare_delta[class_label].append(delta_spearman_corr)
+
+            logger.info(f"\nTemperature {args.temp}")
+
+                
     
-    binned_kls = {class_label: np.array(binned_kls[class_label]) for class_label in binned_kls}
+
+        
     mmds = np.array(mmds)
     wasss = np.array(wasss)
+    overall_binned_kls = np.array(overall_binned_kl)
     logger.info(f"MMD Mean {mmds.mean():.6f} STD {mmds.std():.6f}")
     logger.info(f"2-Wasserstein Mean {wasss.mean():.6f} STD {wasss.std():.6f}\n")
+    logger.info(f"Overall binned KL Mean {overall_binned_kls.mean():.6f} STD {overall_binned_kls.std():.6f}\n")
     
-    
+            
+    binned_kls = {class_label: np.array(binned_kls[class_label]) for class_label in binned_kls}     
     ifm_r2s = {class_label: np.array(ifm_r2s[class_label]) for class_label in ifm_r2s}
     ifm_pears = {class_label: np.array(ifm_pears[class_label]) for class_label in ifm_pears}
     ifm_spears = {class_label: np.array(ifm_spears[class_label]) for class_label in ifm_spears}
@@ -619,45 +712,60 @@ def main(args):
         logger.info(f"Class {class_label} Delta IFM HVGS R^2 {ifm_r2s_hvg_delta[class_label].mean():.6f} +/- {ifm_r2s_hvg_delta[class_label].std():.6f}, Delta Pearson {ifm_pears_hvg_delta[class_label].mean():.6f} +/- {ifm_pears_hvg_delta[class_label].std():.6f}, Delta Spearman {ifm_spears_hvg_delta[class_label].mean():.6f} +/- {ifm_spears_hvg_delta[class_label].std():.6f}")
         logger.info(f"Class {class_label} Delta IFM Rare HVGS R^2 {ifm_r2s_hvg_rare_delta[class_label].mean():.6f} +/- {ifm_r2s_hvg_rare_delta[class_label].std():.6f} Delta Pearson {ifm_pears_hvg_rare_delta[class_label].mean():.6f} +/- {ifm_pears_hvg_rare_delta[class_label].std():.6f} Delta Spearman {ifm_spears_hvg_rare_delta[class_label].mean():.6f} +/- {ifm_spears_hvg_rare_delta[class_label].std():.6f}")
     
+    # Log mean and std of leiden kl and incep scores
+    leiden_kl_mean = np.mean(leiden_kls)
+    leiden_kl_std = np.std(leiden_kls)
+    # set_trace()
+    incep_score_mean = np.mean(incep_scores)
+    incep_score_std = np.std(incep_scores)
+    
     logger.info("Preparing metrics to a pandas dataframe...")
     # Prepare the data for the DataFrame
     data = []
 
     # Add MMD and Wasserstein metrics
-    data.append(["Overall", "MMD Mean", mmds.mean(), mmds.std()])
-    data.append(["Overall", "2-Wasserstein Mean", wasss.mean(), wasss.std()])
+    data.append(["Overall", "MMD", mmds.tolist()])
+    data.append(["Overall", "2-Wasserstein", wasss.tolist()])
+    data.append(["Overall", "Leiden KL", leiden_kls])
+    data.append(["Overall", "Inception Score", incep_scores])
+    data.append(["Overall", "Binned KL", overall_binned_kls.tolist()])
 
     # Add IFM metrics for each class label
     for class_label in label_combinations:
-        data.append([class_label, "IFM R^2", ifm_r2s[class_label]])
-        data.append([class_label, "IFM Pearson", ifm_pears[class_label]])
-        data.append([class_label, "IFM Spearman", ifm_spears[class_label]])
-        data.append([class_label, "IFM HVGS R^2", ifm_r2s_hvg[class_label]])
-        data.append([class_label, "IFM HVGS Pearson", ifm_pears_hvg[class_label]])
-        data.append([class_label, "IFM HVGS Spearman", ifm_spears_hvg[class_label]])
-        data.append([class_label, "IFM Rare HVGS R^2", ifm_r2s_hvg_rare[class_label]])
-        data.append([class_label, "IFM Rare HVGS Pearson", ifm_pears_hvg_rare[class_label]])
-        data.append([class_label, "IFM Rare HVGS Spearman", ifm_spears_hvg_rare[class_label]])
-        data.append([class_label, "Delta IFM R^2", ifm_r2s_delta[class_label]])
-        data.append([class_label, "Delta IFM Pearson", ifm_pears_delta[class_label]])
-        data.append([class_label, "Delta IFM Spearman", ifm_spears_delta[class_label]])
-        data.append([class_label, "Delta IFM HVGS R^2", ifm_r2s_hvg_delta[class_label]])
-        data.append([class_label, "Delta IFM HVGS Pearson", ifm_pears_hvg_delta[class_label]])
-        data.append([class_label, "Delta IFM HVGS Spearman", ifm_spears_hvg_delta[class_label]])
-        data.append([class_label, "Delta IFM Rare HVGS R^2", ifm_r2s_hvg_rare_delta[class_label]])
-        data.append([class_label, "Delta IFM Rare HVGS Pearson", ifm_pears_hvg_rare_delta[class_label]])
-        data.append([class_label, "Delta IFM Rare HVGS Spearman", ifm_spears_hvg_rare_delta[class_label]])
+        data.append([class_label, "IFM R^2", ifm_r2s[class_label].tolist()])
+        data.append([class_label, "IFM Pearson", ifm_pears[class_label].tolist()])
+        data.append([class_label, "IFM Spearman", ifm_spears[class_label].tolist()])
+        data.append([class_label, "IFM HVGS R^2", ifm_r2s_hvg[class_label].tolist()])
+        data.append([class_label, "IFM HVGS Pearson", ifm_pears_hvg[class_label].tolist()])
+        data.append([class_label, "IFM HVGS Spearman", ifm_spears_hvg[class_label].tolist()])
+        data.append([class_label, "IFM Rare HVGS R^2", ifm_r2s_hvg_rare[class_label].tolist()])
+        data.append([class_label, "IFM Rare HVGS Pearson", ifm_pears_hvg_rare[class_label].tolist()])
+        data.append([class_label, "IFM Rare HVGS Spearman", ifm_spears_hvg_rare[class_label].tolist()])
+        data.append([class_label, "Delta IFM R^2", ifm_r2s_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM Pearson", ifm_pears_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM Spearman", ifm_spears_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM HVGS R^2", ifm_r2s_hvg_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM HVGS Pearson", ifm_pears_hvg_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM HVGS Spearman", ifm_spears_hvg_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM Rare HVGS R^2", ifm_r2s_hvg_rare_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM Rare HVGS Pearson", ifm_pears_hvg_rare_delta[class_label].tolist()])
+        data.append([class_label, "Delta IFM Rare HVGS Spearman", ifm_spears_hvg_rare_delta[class_label].tolist()])
     # Create a DataFrame
-    df = pd.DataFrame(data, columns=["Class Label", "Metric", "Mean", "STD"])
+    df = pd.DataFrame(data, columns=["Class Label", "Metric", "Values"])
     logger.info("Done.")
 
-    
+    # set_trace()
     # Define the CSV file path
     csv_file_path = os.path.join(run_directory, "computed_metrics.csv")
     logger.info(f"Saving computed metrics to {csv_file_path}")
     # Save the DataFrame to a CSV file
     df.to_csv(csv_file_path, index=False)
     logger.info("Done.")
+    
+    
+
+    logger.info(f"Leiden KL Divergence Mean: {leiden_kl_mean:.6f} +/- {leiden_kl_std:.6f}")
+    logger.info(f"Inception Score Mean: {incep_score_mean:.6f} +/- {incep_score_std:.6f}")
 
     # Save the logger information to a file
     logger.info("Saving logger...")
