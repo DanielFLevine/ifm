@@ -180,7 +180,7 @@ def parse_arguments():
     parser.add_argument(
         "--leiden_resol",
         type=float,
-        default=1.0,
+        default=0.3,
         help="Resolution parameter for Leiden clustering"
     )
     parser.add_argument(
@@ -194,6 +194,11 @@ def parse_arguments():
         type=int,
         default=20,
         help="Kernel parameter k for adaptive MMD"
+    )
+    parser.add_argument(
+        "--lazy_run",
+        action="store_true",
+        help="Flag to run in lazy mode, skipping computationally expensive metrics like Wasserstein distance"
     )
     return parser.parse_args()
 
@@ -404,6 +409,20 @@ def load_umap_model(umap_pickle_name):
         umap_model = pickle.load(f)
     return umap_model
 
+def load_leiden_classifier(args):
+    # TODO: change to load from MLP trained on 1000D
+    with open(args.leiden_classifier_path, "r") as f:
+        leiden_classifiers = json.load(f)
+    leiden_classifier_weights = leiden_classifiers[args.pert_split][str(args.leiden_resol)]["weights"]
+    num_leiden_classes =  leiden_classifiers[args.pert_split][str(args.leiden_resol)]["output_dim"]
+    logger.info(f"Load Leiden classifier MLP from CHECKPOINT PATH: {leiden_classifier_weights}...")
+    leiden_classifier_model = MLPClassifier(input_dim=1000,output_dim=num_leiden_classes)
+    leiden_classifier_model.load_state_dict(torch.load(leiden_classifier_weights))
+    leiden_classifier_model = leiden_classifier_model.to('cuda')
+    leiden_classifier_model.eval()
+    logger.info("Done.")
+    return leiden_classifier_model
+
 def main(args):
     # Create save directories
     experiment_directory = os.path.join("/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/inference_results", f"{args.pert_split}_split",f"pretrained-{args.pretrained_weights}_space{args.space_dim}", f"temperature-{args.temp}")
@@ -499,6 +518,7 @@ def main(args):
     if args.idfm:
         euler_step_size = 1/(time_points-1)
     for i in range(num_repeats):
+        logger.info(f"+++++ Repeat {i+1}/{num_repeats} +++++")
         with torch.no_grad():
             ifm_pca_data, umap_labels = generate_ifm_pca_data(model, test_dataloader, prompts, tokenizer, args, device, time_points)
         
@@ -567,20 +587,41 @@ def main(args):
             break
         else:
             logger.info("Computing metrics...")
+            logger.info("Computing non-class dependent metrics first...")
 
+            # logger.info("----- Computing RBF-MMD and 2-Wass on 10D UMAP fit on PCA'd GT data... -----")
+            # umap_model_10D_on_GT = load_umap_model(f"{args.pert_split}_split_umap_model_10D.pkl")
+            # umap_10D_on_GT_ifm_data = umap_model_10D_on_GT.transform(ifm_pca_data)
+            # umap_10D_on_GT_gt_data = umap_model_10D_on_GT.transform(gt_pca_data)
 
-            logger.info("----- Computing RBF-MMD and 2-Wass on 10D UMAP fit on PCA'd GT data... -----")
-            umap_model_10D_on_GT = load_umap_model(f"{args.pert_split}_split_umap_model_10D.pkl")
-            umap_10D_on_GT_ifm_data = umap_model_10D_on_GT.transform(ifm_pca_data)
-            umap_10D_on_GT_gt_data = umap_model_10D_on_GT.transform(gt_pca_data)
-
-            mmd = mmd_rbf(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data)
-            umap10D_mmds.append(mmd)
-            adaptive_mmd = mmd_rbf_adaptive(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data, k=args.adaptive_mmd_kernel_k)
-            umap10D_adaptive_mmds.append(adaptive_mmd)
-            wass = compute_wass(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data)
-            umap10D_wasss.append(wass)
+            # mmd = mmd_rbf(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data)
+            # umap10D_mmds.append(mmd)
+            # adaptive_mmd = mmd_rbf_adaptive(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data, k=args.adaptive_mmd_kernel_k)
+            # umap10D_adaptive_mmds.append(adaptive_mmd)
+            # if not args.lazy_run:
+            #     wass = compute_wass(umap_10D_on_GT_ifm_data, umap_10D_on_GT_gt_data)
+            #     umap10D_wasss.append(wass)
+            # else:
+            #     wass = 0
+            #     logger.info("Skipping Wass...")
             
+            # logger.info(f"---> MMD: {mmd}")
+            # logger.info(f"---> Adaptive MMD: {adaptive_mmd}")
+            # logger.info(f"---> Wass: {wass}")
+            # logger.info("---------- Done. ----------")
+
+            logger.info(f"----- Computing RBF MMD and 2-Wass on 10D UMAP fit on PCA'd GT data and PCA'd IFM data combined... -----")
+            combined_umap10D_gt_data, combined_umap10D_ifm_data = umap_embed(gt_pca_data, ifm_pca_data, 10)
+            mmd = mmd_rbf(combined_umap10D_ifm_data, combined_umap10D_gt_data)
+            umap_combined10D_mmds.append(mmd)
+            adaptive_mmd = mmd_rbf_adaptive(combined_umap10D_ifm_data, combined_umap10D_gt_data, k=args.adaptive_mmd_kernel_k)
+            umap_combined10D_adaptive_mmds.append(adaptive_mmd)
+            if not args.lazy_run:
+                wass = compute_wass(combined_umap10D_ifm_data, combined_umap10D_gt_data)
+                umap_combined10D_wasss.append(wass)
+            else:
+                wass = 0
+                logger.info("Skipping Wass...")
             logger.info(f"---> MMD: {mmd}")
             logger.info(f"---> Adaptive MMD: {adaptive_mmd}")
             logger.info(f"---> Wass: {wass}")
@@ -610,18 +651,7 @@ def main(args):
             # # logger.info(f"---> Wass: {wass}")
             # logger.info("---------- Done. ----------")
 
-            logger.info(f"----- Computing RBF MMD and 2-Wass on 10D UMAP fit on PCA'd GT data and PCA'd IFM data combined... -----")
-            combined_umap10D_gt_data, combined_umap10D_ifm_data = umap_embed(gt_pca_data, ifm_pca_data, 10)
-            mmd = mmd_rbf(combined_umap10D_ifm_data, combined_umap10D_gt_data)
-            umap_combined10D_mmds.append(mmd)
-            adaptive_mmd = mmd_rbf_adaptive(combined_umap10D_ifm_data, combined_umap10D_gt_data, k=args.adaptive_mmd_kernel_k)
-            umap_combined10D_adaptive_mmds.append(adaptive_mmd)
-            wass = compute_wass(combined_umap10D_ifm_data, combined_umap10D_gt_data)
-            umap_combined10D_wasss.append(wass)
-            logger.info(f"---> MMD: {mmd}")
-            logger.info(f"---> Adaptive MMD: {adaptive_mmd}")
-            logger.info(f"---> Wass: {wass}")
-            logger.info("---------- Done. ----------")
+            
             
             if args.z_score:
                 logger.info("Normalizing genes by Z-score...")
@@ -629,48 +659,72 @@ def main(args):
                 expression_data = z_score_norm(expression_data)
             
             # ----------------- TODO: need to take a closer look at this ----------------- #
-            # Load UMAP model that is trained on PCA GT data
-            umap_model_dir = "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/umap_models"
-            umap_model_path = os.path.join(umap_model_dir, f"{args.pert_split}_split_umap_model.pkl")
-            with open(umap_model_path, 'rb') as f:
-                logger.info(f"Loading UMAP model from {umap_model_path}...")
-                umap_model = pickle.load(f)
-                logger.info("Done.")
-            
-            
-            logger.info("Transforming PCA expression data and PCA IFM data to 2D UMAP...")
-            umap2D_gt_pca_data = umap_model.transform(gt_pca_data)
-            umap2D_ifm_pca_data = umap_model.transform(ifm_pca_data)
-            logger.info("Done.")
 
-            full_gt_adata.obsm["X_umap"] = umap2D_gt_pca_data
-            ifm_pca_adata.obsm["X_umap"] = umap2D_ifm_pca_data
-            # Leiden clustering on PCA GT data
-            
-            with open(args.leiden_classifier_path, "r") as f:
-                leiden_classifiers = json.load(f)
-            leiden_classifier_weights = leiden_classifiers[args.pert_split][str(args.leiden_resol)]["weights"]
-            num_leiden_classes =  leiden_classifiers[args.pert_split][str(args.leiden_resol)]["output_dim"]
-            logger.info(f"Load Leiden classifier MLP from CHECKPOINT PATH: {leiden_classifier_weights}...")
-            leiden_classifier_model = MLPClassifier(output_dim=num_leiden_classes)
-            leiden_classifier_model.load_state_dict(torch.load(leiden_classifier_weights))
-            leiden_classifier_model = leiden_classifier_model.to('cuda')
-            leiden_classifier_model.eval()
-            logger.info("Done.")
-
-            logger.info("Predicting Leiden labels on generated ifm_pca_data...")
-            X_gen = ifm_pca_adata.obsm['X_umap']
-            X_gen_tensor = torch.tensor(X_gen, dtype=torch.float32, device="cuda")
+            logger.info("----- Computing Leiden Related Metrics on 1000D PCA'd GT and IFM data... -----")
+            leiden_classifier_model = load_leiden_classifier(args)
             with torch.no_grad():
-                outputs = leiden_classifier_model(X_gen_tensor)
+                outputs = leiden_classifier_model(torch.tensor(ifm_pca_adata.X, dtype=torch.float32, device="cuda"))
                 _, y_gen_pred = torch.max(outputs, 1)
             ifm_pca_adata.obs['leiden_pred'] = y_gen_pred.cpu().numpy().astype(str)
+
+            gt_adata_with_leiden = sc.read_h5ad("/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/test_data_with_leiden_labels/ct_pert/resol0.3/test_adata_with_Leiden_on_1000D_resol0.3_cluster8.h5ad")
+            leiden_kl_diveregnce = leiden_KL(gt_adata_with_leiden, ifm_pca_adata)
+            logger.info(f"--->Leiden KL Divergence: {leiden_kl_diveregnce}")
+            leiden_kls.append(leiden_kl_diveregnce)
             
-            logger.info("Plotting UMAP with predicted Leiden clusters for generated data...")
-            if i == 0:
-                sc.settings.figdir = umap_directory
-                sc.pl.umap(ifm_pca_adata, color='leiden_pred', title='Generated Cells UMAP: Predicted Leiden Clusters', save='gen_data_Leiden_pred.png')
-                sc.pl.umap(ifm_pca_adata, color='combined_labels', title='Generated Cells UMAP: Combo', save='gen_data_combined_labels.png')
+            predictions = outputs.softmax(dim=1).detach()
+            incep_score = inception_score(predictions)
+            incep_scores.append(incep_score)
+            logger.info(f"---> Inception Score: {incep_score}")
+            logger.info("---------- Done. ----------")
+
+
+
+
+
+
+            # Load UMAP model that is trained on PCA GT data
+            # umap_model_dir = "/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/umap_models"
+            # umap_model_path = os.path.join(umap_model_dir, f"{args.pert_split}_split_umap_model.pkl")
+            # with open(umap_model_path, 'rb') as f:
+            #     logger.info(f"Loading UMAP model from {umap_model_path}...")
+            #     umap_model = pickle.load(f)
+            #     logger.info("Done.")
+            
+            
+            # logger.info("Transforming PCA expression data and PCA IFM data to 2D UMAP...")
+            # umap2D_gt_pca_data = umap_model.transform(gt_pca_data)
+            # umap2D_ifm_pca_data = umap_model.transform(ifm_pca_data)
+            # logger.info("Done.")
+
+            # full_gt_adata.obsm["X_umap"] = umap2D_gt_pca_data
+            # ifm_pca_adata.obsm["X_umap"] = umap2D_ifm_pca_data
+            # # Leiden clustering on PCA GT data
+            
+            # with open(args.leiden_classifier_path, "r") as f:
+            #     leiden_classifiers = json.load(f)
+            # leiden_classifier_weights = leiden_classifiers[args.pert_split][str(args.leiden_resol)]["weights"]
+            # num_leiden_classes =  leiden_classifiers[args.pert_split][str(args.leiden_resol)]["output_dim"]
+            # logger.info(f"Load Leiden classifier MLP from CHECKPOINT PATH: {leiden_classifier_weights}...")
+            # leiden_classifier_model = MLPClassifier(output_dim=num_leiden_classes)
+            # leiden_classifier_model.load_state_dict(torch.load(leiden_classifier_weights))
+            # leiden_classifier_model = leiden_classifier_model.to('cuda')
+            # leiden_classifier_model.eval()
+            # logger.info("Done.")
+
+            # logger.info("Predicting Leiden labels on generated ifm_pca_data...")
+            # X_gen = ifm_pca_adata.obsm['X_umap']
+            # X_gen_tensor = torch.tensor(X_gen, dtype=torch.float32, device="cuda")
+            # with torch.no_grad():
+            #     outputs = leiden_classifier_model(X_gen_tensor)
+            #     _, y_gen_pred = torch.max(outputs, 1)
+            # ifm_pca_adata.obs['leiden_pred'] = y_gen_pred.cpu().numpy().astype(str)
+            
+            # logger.info("Plotting UMAP with predicted Leiden clusters for generated data...")
+            # if i == 0:
+            #     sc.settings.figdir = umap_directory
+            #     sc.pl.umap(ifm_pca_adata, color='leiden_pred', title='Generated Cells UMAP: Predicted Leiden Clusters', save='gen_data_Leiden_pred.png')
+            #     sc.pl.umap(ifm_pca_adata, color='combined_labels', title='Generated Cells UMAP: Combo', save='gen_data_combined_labels.png')
             #TODO: make this line look better
             # full_gt_adata = sc.read_h5ad(f"/gpfs/radev/scratch/dijk/sh2748/calmflow_singlecell/test_data_with_leiden_labels/{args.pert_split}/resol{args.leiden_resol}/test_adata_with_Leiden_resol{args.leiden_resol}_cluster{num_leiden_classes}.h5ad")
             # if i == 0:
@@ -797,6 +851,9 @@ def main(args):
     umap_combined10D_mmds = np.array(umap_combined10D_mmds)
     umap_combined10D_adaptive_mmds = np.array(umap_combined10D_adaptive_mmds)
     umap_combined10D_wasss = np.array(umap_combined10D_wasss)
+
+    leiden_kls = np.array(leiden_kls)
+    incep_scores = np.array(incep_scores)
     
     # full_pca_mmds = np.array(full_pca_mmds)
     # full_pca_adaptive_mmds = np.array(full_pca_adaptive_mmds)
@@ -861,26 +918,27 @@ def main(args):
     logger.info(f"Wasserstein GT UMAP: Mean {umap10D_wasss.mean():.6f} STD {umap10D_wasss.std():.6f}")
     logger.info(f"MMD UMAP Together: Mean {umap_combined10D_mmds.mean():.6f} STD {umap_combined10D_mmds.std():.6f}")
     logger.info(f"Wasserstein UMAP Together: Mean {umap_combined10D_wasss.mean():.6f} STD {umap_combined10D_wasss.std():.6f}")
-    logger.info(f"Leiden KL Divergence: placeholder")
-    logger.info(f"Inception Score: placeholder")
+    logger.info(f"Leiden KL Divergence: Mean {leiden_kls.mean():.6f} STD {leiden_kls.std():.6f}")
+    logger.info(f"Inception Score: placeholder: Mean {incep_scores.mean():.6f} STD {incep_scores.std():.6f}\n")
+    
     logger.info(f"Overall IFM R^2: Mean {all_r2s.mean():.6f} STD {all_r2s.std():.6f}")
     logger.info(f"Overall IFM Pearson: Mean {all_pears.mean():.6f} STD {all_pears.std():.6f}")
-    logger.info(f"Overall IFM Spearman: Mean {all_spears.mean():.6f} STD {all_spears.std():.6f}")
+    logger.info(f"Overall IFM Spearman: Mean {all_spears.mean():.6f} STD {all_spears.std():.6f}\n")
     
     logger.info(f"Overall IFM TOP {len(de_genes)} DE GENES R^2: Mean {all_r2s_de.mean():.6f} STD {all_r2s_de.std():.6f}")
     logger.info(f"Overall IFM TOP {len(de_genes)} DE GENES Pearson: Mean {all_pears_de.mean():.6f} STD {all_pears_de.std():.6f}")
-    logger.info(f"Overall IFM TOP {len(de_genes)} DE GENES Spearman: Mean {all_spears_de.mean():.6f} STD {all_spears_de.std():.6f}")
+    logger.info(f"Overall IFM TOP {len(de_genes)} DE GENES Spearman: Mean {all_spears_de.mean():.6f} STD {all_spears_de.std():.6f}\n")
     
     logger.info(f"Overall Delta IFM R^2: Mean {all_r2s_delta.mean():.6f} STD {all_r2s_delta.std():.6f}")
     logger.info(f"Overall Delta IFM Pearson: Mean {all_pears_delta.mean():.6f} STD {all_pears_delta.std():.6f}")
-    logger.info(f"Overall Delta IFM Spearman: Mean {all_spears_delta.mean():.6f} STD {all_spears_delta.std():.6f}")
+    logger.info(f"Overall Delta IFM Spearman: Mean {all_spears_delta.mean():.6f} STD {all_spears_delta.std():.6f}\n")
     
     logger.info(f"Overall Delta IFM TOP {len(de_genes)} DE GENES R^2: Mean {all_r2s_de_delta.mean():.6f} STD {all_r2s_de_delta.std():.6f}")
     logger.info(f"Overall Delta IFM TOP {len(de_genes)} DE GENES Pearson: Mean {all_pears_de_delta.mean():.6f} STD {all_pears_de_delta.std():.6f}")
-    logger.info(f"Overall Delta IFM TOP {len(de_genes)} DE GENES Spearman: Mean {all_spears_de_delta.mean():.6f} STD {all_spears_de_delta.std():.6f}")
+    logger.info(f"Overall Delta IFM TOP {len(de_genes)} DE GENES Spearman: Mean {all_spears_de_delta.mean():.6f} STD {all_spears_de_delta.std():.6f}\n")
     
     logger.info(f"Adaptive MMD (k={args.adaptive_mmd_kernel_k}) GT UMAP: Mean {umap10D_adaptive_mmds.mean():.6f} STD {umap10D_adaptive_mmds.std():.6f}")
-    logger.info(f"Adaptive MMD UMAP Together (k={args.adaptive_mmd_kernel_k}) Mean {umap_combined10D_adaptive_mmds.mean():.6f} STD {umap_combined10D_adaptive_mmds.std():.6f}")
+    logger.info(f"Adaptive MMD UMAP Together (k={args.adaptive_mmd_kernel_k}) Mean {umap_combined10D_adaptive_mmds.mean():.6f} STD {umap_combined10D_adaptive_mmds.std():.6f}\n")
     
     # Log mean and std of leiden kl and incep scores
     # leiden_kl_mean = np.mean(leiden_kls)
