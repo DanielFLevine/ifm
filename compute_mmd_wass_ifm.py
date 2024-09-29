@@ -201,7 +201,9 @@ def main(args):
         euler_step_size = 1 / (time_points - 1)
 
     batch_size = args.batch_size
-    num_steps = args.num_samples // batch_size
+    num_steps = args.num_samples // (batch_size * args.points_per_sample)
+
+    assert args.num_samples % (batch_size * args.points_per_sample) == 0, "batch_size * points_per_sample must divide num_samples"
 
     classifier_entropies = []
     classifier_kl_divs = []
