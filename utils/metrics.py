@@ -7,11 +7,12 @@ from torch import nn
 import torch.nn.functional as F
 import scanpy as sc
 import umap
-from sklearn.metrics import pairwise
+from sklearn.metrics import pairwise, pairwise_distances
 from scipy.spatial.distance import cdist
 from torch.utils.data import DataLoader, TensorDataset
 from scipy.stats import entropy
 from sklearn.neighbors import KernelDensity
+import os
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -119,6 +120,24 @@ def total_variation_distance(p, q):
     """
     return 0.5 * np.sum(np.abs(p - q))
 
+def weighted_total_variation_distance(p, q, weights):
+    """
+    Compute the weighted total variation distance between two discrete probability distributions.
+    
+    Parameters:
+    p : numpy array of shape (n_classes,)
+        Ground truth probability distribution.
+    q : numpy array of shape (n_classes,)
+        Generated probability distribution.
+    weights : numpy array of shape (n_classes,)
+        Weights for each class, typically the ground truth probabilities.
+    
+    Returns:
+    weighted_tvd : float
+        Weighted total variation distance.
+    """
+    return 0.5 * np.sum(weights * np.abs(p - q))
+
 def evaluate_model(checkpoint_path='/home/dfl32/scratch/unconditional_classifier_combined_labels/checkpoints_hidden_dim_256_2/checkpoint_step100000.pth', 
                    generated_data=None, 
                    adata_path='/home/dfl32/project/ifm/cinemaot_data/conditional_cinemaot/integrated_ifm_leiden_02.h5ad', 
@@ -177,8 +196,12 @@ def evaluate_model(checkpoint_path='/home/dfl32/scratch/unconditional_classifier
             all_probs.append(probs)
 
     all_probs = torch.cat(all_probs, dim=0)
+    incep_score = inception_score(all_probs)
     sample_entropy = -torch.sum(all_probs * torch.log(all_probs), dim=1)
     avg_entropy = torch.mean(sample_entropy).item()
+
+    # Compute plausibility score
+    plausibility_score = torch.mean(torch.max(all_probs, dim=1)[0]).item()
 
     # Compute the average probability vector
     avg_prob_vector = torch.mean(all_probs, dim=0)
@@ -194,6 +217,9 @@ def evaluate_model(checkpoint_path='/home/dfl32/scratch/unconditional_classifier
     # Calculate total variation distance
     tv_distance = 0.5 * torch.sum(torch.abs(avg_prob_vector - true_probs)).item()
 
+    # Compute weighted total variation distance
+    weighted_tv_distance = weighted_total_variation_distance(avg_prob_vector.cpu().numpy(), true_probs.cpu().numpy(), true_probs.cpu().numpy())
+
     # Compute KL divergence between predicted and true label distributions
     predicted_labels = torch.argmax(all_probs, dim=1).cpu().numpy()
     predicted_label_dist = np.bincount(predicted_labels, minlength=output_dim) / len(predicted_labels)
@@ -205,4 +231,184 @@ def evaluate_model(checkpoint_path='/home/dfl32/scratch/unconditional_classifier
     
     label_kl_div = entropy(true_label_dist, predicted_label_dist)
 
-    return avg_entropy, kl_div, tv_distance, label_kl_div
+    return avg_entropy, kl_div, tv_distance, label_kl_div, weighted_tv_distance, incep_score, plausibility_score
+
+def inception_score(p_yx):
+    """
+    Compute the Inception Score for the generated data.
+
+    Parameters:
+    p_yx : torch tensor of shape [n_samples, n_classes)]
+        The predicted class probabilities for the generated data.
+        p(y|x), where y is the label, x is the data
+
+    Returns:
+    inception_score : float
+        The computed Inception Score.
+    """
+    py = p_yx.mean(dim=0) # marginal prob, p(y)
+    kl_div = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(probs=p_yx),
+        torch.distributions.Categorical(probs=py)
+    ).mean(dim=0)
+    
+    inception_score = kl_div.exp()
+    return inception_score.item()
+
+def leiden_KL(gt_labels, pred_labels):
+    """
+    Compute the KL divergence between the ground truth and generated data using Leiden clustering.
+
+
+    Returns:
+    kl_divergence : torch.Tensor
+        The computed KL divergence between the ground truth and generated data.
+    """
+
+    # We use the Leiden labels as bins directly
+    gt_hist = np.bincount(gt_labels) / len(gt_labels)
+    pred_hist = np.bincount(pred_labels, minlength=len(gt_hist)) / len(pred_labels)
+
+    gt_hist_tensor = torch.tensor(gt_hist)
+    pred_hist_tensor = torch.tensor(pred_hist)
+
+    # set_trace()
+
+    kl_divergence = torch.distributions.kl.kl_divergence(
+        torch.distributions.Categorical(probs=gt_hist_tensor.view(-1)),
+        torch.distributions.Categorical(probs=pred_hist_tensor.view(-1))
+    )
+    # set_trace()
+    return kl_divergence.item()
+
+def adaptive_rbf_kernel(X, Y=None, k=5):
+    """
+    Adaptive RBF kernel that adjusts the bandwidth based on local densities.
+    
+    Arguments:
+        X {[n_samples1, dim]} -- [Input matrix X]
+        Y {[n_samples2, dim]} -- [Optional input matrix Y; if None, uses X for both]
+        k {int} -- [Number of neighbors to determine the adaptive bandwidth] (default: {5})
+    
+    Returns:
+        Kernel matrix K using adaptive RBF kernel
+    """
+    if Y is None:
+        Y = X
+    
+    # Compute pairwise distances (using euclidean for nearest neighbor bandwidth calculation)
+    dists_X = pairwise_distances(X, X, metric='euclidean')
+    dists_Y = pairwise_distances(Y, Y, metric='euclidean') if Y is not X else dists_X
+    
+    # Compute adaptive bandwidth for each point based on k-nearest neighbors
+    sigma_X = np.mean(np.sort(dists_X, axis=1)[:, 1:k+1], axis=1)  # Use k nearest neighbors
+    sigma_Y = np.mean(np.sort(dists_Y, axis=1)[:, 1:k+1], axis=1)  # Use k nearest neighbors
+
+    # Compute squared pairwise distances directly
+    sq_dists = pairwise_distances(X, X, metric='sqeuclidean') if Y is X else \
+               pairwise_distances(X, Y, metric='sqeuclidean')
+    
+    # Compute the adaptive RBF kernel matrix with squared distances and 2 * sigma^2 in the denominator
+    K = np.exp(-sq_dists / (2 * (sigma_X[:, None] * sigma_X[None, :]))) if Y is X else \
+        np.exp(-sq_dists / (2 * (sigma_X[:, None] * sigma_Y[None, :])))
+    
+    return K
+
+def mmd_rbf_adaptive(X, Y, k=5):
+    """
+    MMD using adaptive RBF (Gaussian) kernel.
+    
+    Arguments:
+        X {[n_sample1, dim]} -- [Input matrix X]
+        Y {[n_sample2, dim]} -- [Input matrix Y]
+    
+    Keyword Arguments:
+        k {int} -- [Number of neighbors to use for adaptive bandwidth] (default: {5})
+    
+    Returns:
+        [scalar] -- [MMD value]
+    """
+    XX = adaptive_rbf_kernel(X, X, k)
+    YY = adaptive_rbf_kernel(Y, Y, k)
+    XY = adaptive_rbf_kernel(X, Y, k)
+    
+    return XX.mean() + YY.mean() - 2 * XY.mean()
+
+def generate_latex_table(all_metrics, model_name, split_type):
+    """
+    Generate a LaTeX table with models as rows and metrics as columns.
+    
+    Args:
+    all_metrics (dict): A dictionary with model identifiers as keys and metric dictionaries as values.
+    
+    Returns:
+    None. Saves the LaTeX table to a file.
+    """
+    table_content = []
+    table_content.append("\\documentclass{article}")
+    table_content.append("\\usepackage{booktabs}")
+    table_content.append("\\usepackage{longtable}")
+    table_content.append("\\usepackage{array}")
+    table_content.append("\\begin{document}")
+    table_content.append("\\begin{longtable}{l*{20}{c}}")  # Adjust the number of columns as needed
+    table_content.append("\\caption{Metrics for all models} \\\\")
+    table_content.append("\\toprule")
+
+    # Get all unique metric names
+    all_metric_names = set()
+    for metrics in all_metrics.values():
+        all_metric_names.update(metrics.keys())
+    all_metric_names = sorted(list(all_metric_names))
+
+    # Replace "R^2" with "$R^2$" in metric names
+    all_metric_names = [name.replace("R^2", "$R^2$") for name in all_metric_names]
+
+    # Add header row
+    header = ["Model"] + all_metric_names
+    table_content.append(" & ".join(header) + " \\\\")
+    table_content.append("\\midrule")
+    table_content.append("\\endfirsthead")
+    
+    # Repeat header for subsequent pages
+    table_content.append("\\multicolumn{" + str(len(header)) + "}{c}{\\tablename\\ \\thetable\\ -- continued from previous page} \\\\")
+    table_content.append("\\toprule")
+    table_content.append(" & ".join(header) + " \\\\")
+    table_content.append("\\midrule")
+    table_content.append("\\endhead")
+    
+    table_content.append("\\midrule")
+    table_content.append("\\multicolumn{" + str(len(header)) + "}{r}{Continued on next page} \\\\")
+    table_content.append("\\endfoot")
+    
+    table_content.append("\\bottomrule")
+    table_content.append("\\endlastfoot")
+    
+    # Add data rows
+    for model, metrics in all_metrics.items():
+        row = [model]
+        for metric_name in all_metric_names:
+            original_metric_name = metric_name.replace("$R^2$", "R^2")
+            if original_metric_name in metrics:
+                mean = np.mean(metrics[original_metric_name])
+                std = np.std(metrics[original_metric_name])
+                row.append(f"{mean:.5f} $\\pm$ {std:.5f}")
+            else:
+                row.append("-")
+        table_content.append(" & ".join(row) + " \\\\")
+    
+    table_content.append("\\end{longtable}")
+    table_content.append("\\end{document}")
+    
+    # Join all lines and add newline characters
+    table_content = "\n".join(table_content)
+    
+    # Save the table to a file
+    save_dir = "/home/dfl32/project/ifm/tables"
+    os.makedirs(save_dir, exist_ok=True)
+    file_path = os.path.join(save_dir, f"{model_name}_{split_type}_metrics_table_all_models.tex")
+    
+    with open(file_path, "w") as f:
+        f.write(table_content)
+    
+    logger.info(f"LaTeX table saved to {file_path}")
+

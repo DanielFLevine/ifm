@@ -8,13 +8,16 @@ import safetensors
 import torch
 from torch import nn
 from tqdm import tqdm
-from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed, evaluate_model, total_variation_distance
+from utils.metrics import mmd_rbf, compute_wass, transform_gpu, umap_embed, evaluate_model, total_variation_distance, mmd_rbf_adaptive
 import scanpy as sc
 from scipy.sparse import issparse
+from scipy.stats import pearsonr, spearmanr
 from transformers import GPTNeoXForCausalLM, GPTNeoXConfig
 from utils.modules import CustomVAEDecoder, TwoLayerMLP
 from sklearn.neighbors import NearestNeighbors
 from scipy.stats import entropy
+import umap
+import matplotlib.pyplot as plt
 
 logging.basicConfig(format='[%(levelname)s:%(asctime)s] %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,10 +41,43 @@ def parse_arguments():
     parser.add_argument("--reshape_postvae", action="store_true")
     parser.add_argument("--umap_embed", action="store_true")
     parser.add_argument("--idfm", action="store_true")
+    parser.add_argument("--z_score", action="store_true")
     parser.add_argument("--num_umap_dims", type=int, default=10)
     parser.add_argument("--temp", type=float, default=1.0, help="Temperature for decoding step")
     parser.add_argument("--num_repeats", type=int, default=1, help="Number of times to repeat the generation and sampling process")
+    parser.add_argument("--attention_dropout", type=float, default=0.0, help="Attention dropout")
     return parser.parse_args()
+
+def z_score_norm(matrix):
+    means = np.mean(matrix, axis=0)
+    stds = np.std(matrix, axis=0)
+
+    stds[stds == 0] = 1
+
+    # Perform z-score normalization
+    normalized_matrix = (matrix - means) / stds
+    return normalized_matrix
+
+def compute_statistics(array1, array2):
+    # Ensure the arrays have the same shape
+    if array1.shape != array2.shape:
+        raise ValueError("The input arrays must have the same shape.")
+    
+    # Calculate row-wise means
+    mean1 = np.mean(array1, axis=0)
+    mean2 = np.mean(array2, axis=0)
+    
+    # Calculate R^2
+    correlation_matrix = np.corrcoef(mean1, mean2)
+    r2 = correlation_matrix[0, 1] ** 2
+    
+    # Calculate Pearson correlation
+    pearson_corr, _ = pearsonr(mean1, mean2)
+    
+    # Calculate Spearman correlation
+    spearman_corr, _ = spearmanr(mean1, mean2)
+    
+    return r2, pearson_corr, spearman_corr
 
 def inverse_transform_gpu(data, pca_model):
     components = pca_model.components_
@@ -131,7 +167,8 @@ def main(args):
         model_paths = json.load(f)
     
     weights = "pretrained_weights" if args.pretrained_weights else "random_weights"
-    cp_path = model_paths[weights][str(args.space_dim)]
+    cp_path = model_paths[weights][str(args.attention_dropout)]
+    # cp_path = "/home/dfl32/scratch/training-runs/traincustomTrue-vaeTrue-klw0.3-EleutherAI/pythia-160m-idfmFalse-hdim256idim1024nheads8nblocks2-space5-pps1-preweightsTrue-pca1000-timepoints16-straightpathTrue-drop0.0ifm-2024-08-26_11-32-37"
     logger.info(f"CHECKPOINT PATH: {cp_path}")
 
     config_path = os.path.join(cp_path, "config.json")
@@ -166,11 +203,16 @@ def main(args):
     batch_size = args.batch_size
     num_steps = args.num_samples // batch_size
 
-    cluster_tv_distances = []
     classifier_entropies = []
     classifier_kl_divs = []
     classifier_tv_distances = []
     label_kl_divs = []
+    weighted_tv_distances = []
+    incep_scores = []
+    plausibility_scores = []  # Add this line
+    mmds = {gamma: [] for gamma in args.mmd_gammas}
+    adaptive_mmds = []
+    wassersteins = {reg: [] for reg in args.wass_regs}
 
     for repeat in range(args.num_repeats):
         logger.info(f"Starting repeat {repeat + 1}/{args.num_repeats}")
@@ -202,6 +244,9 @@ def main(args):
                 cells.append(outputs[:, -args.points_per_sample:, :].reshape(args.points_per_sample * batch_size, feature_dim).detach().cpu().numpy())
             cells = np.concatenate(cells, axis=0)
 
+        if repeat == 0:
+            np.save('/home/dfl32/project/ifm/figure_unconditional_data/ifm_cells.npy', cells)
+
         sample_indices = np.random.choice(expression_data.shape[0], size=args.num_samples, replace=False)
         sampled_expression_data = expression_data[sample_indices]
         sampled_labels = adata.obs["leiden"].values[sample_indices].astype(int)  # Convert leiden labels to integers
@@ -210,14 +255,14 @@ def main(args):
         pca_sampled_expression_data = transform_gpu(sampled_expression_data, pca)
         logger.info("Done.")
 
-        generated_labels = assign_labels_to_generated_data(pca_sampled_expression_data, sampled_labels, cells)
+        # generated_labels = assign_labels_to_generated_data(pca_sampled_expression_data, sampled_labels, cells)
 
-        kl_div_leiden, cluster_tv_distance = compute_kl_divergence_and_tv(sampled_labels, generated_labels)
-        cluster_tv_distances.append(cluster_tv_distance)
-        logger.info(f"Cluster KL Divergence: {kl_div_leiden}")
-        logger.info(f"Cluster Total Variation Distance: {cluster_tv_distance}")
+        # kl_div_leiden, cluster_tv_distance = compute_kl_divergence_and_tv(sampled_labels, generated_labels)
+        # cluster_tv_distances.append(cluster_tv_distance)
+        # logger.info(f"Cluster KL Divergence: {kl_div_leiden}")
+        # logger.info(f"Cluster Total Variation Distance: {cluster_tv_distance}")
 
-        avg_entropy, kl_div, tv_distance, label_kl_div = evaluate_model(
+        avg_entropy, kl_div, tv_distance, label_kl_div, weighted_tv_distance, incep_score, plausibility_score = evaluate_model(
             generated_data=cells,
             checkpoint_path=f'/home/dfl32/scratch/unconditional_classifier_combined_labels/checkpoints_hidden_dim_256_{args.leiden}/checkpoint_step8000.pth',
             adata_path=f'/home/dfl32/project/ifm/cinemaot_data/conditional_cinemaot/integrated_ifm_leiden_{leiden}.h5ad'
@@ -226,14 +271,79 @@ def main(args):
         classifier_kl_divs.append(kl_div)
         classifier_tv_distances.append(tv_distance)
         label_kl_divs.append(label_kl_div)
+        weighted_tv_distances.append(weighted_tv_distance)
+        incep_scores.append(incep_score)
+        plausibility_scores.append(plausibility_score)  # Add this line
 
         logger.info(f"Classifier Average Entropy: {avg_entropy}")
         logger.info(f"Classifier KL Divergence: {kl_div}")
         logger.info(f"Classifier Total Variation Distance: {tv_distance}")
         logger.info(f"Label Distribution KL Divergence: {label_kl_div}")
+        logger.info(f"Weighted Total Variation Distance: {weighted_tv_distance}")
+        logger.info(f"Inception Score: {incep_score}")
+        logger.info(f"Plausibility Score: {plausibility_score}")  # Add this line
 
-    mean_cluster_tv = np.mean(cluster_tv_distances)
-    std_cluster_tv = np.std(cluster_tv_distances)
+        logger.info("Inverse transforming IFM generated cells...")
+        cells_ag = inverse_transform_gpu(cells, pca)
+
+        if args.z_score:
+            logger.info("Normalizing genes by Z-score...")
+            cells_ag = z_score_norm(cells_ag)
+            sampled_expression_data = z_score_norm(sampled_expression_data)
+
+        logger.info("Computing metrics...")
+
+        # UMAP fitting and transformation
+        umap_model = umap.UMAP(n_components=2)
+        umap_sampled = umap_model.fit_transform(pca_sampled_expression_data)
+        umap_generated = umap_model.transform(cells)
+        if repeat == 0:
+        # Plotting
+            plt.figure(figsize=(5, 4))
+            plt.scatter(umap_sampled[:, 0], umap_sampled[:, 1], c='blue', label='Sampled', alpha=0.5, s=0.2)
+            plt.scatter(umap_generated[:, 0], umap_generated[:, 1], c='red', label='Generated', alpha=0.5, s=0.2)
+            plt.legend(markerscale=5)
+            plt.title('Sampled vs Generated Data')
+            plt.xticks([])
+            plt.yticks([])
+            plt.savefig(f'/home/dfl32/project/ifm/umaps/ifm_leiden_{args.leiden}_sampled_vs_generated.png', bbox_inches='tight')
+            plt.close()
+
+            plt.figure(figsize=(5, 4))
+            scatter = plt.scatter(umap_sampled[:, 0], umap_sampled[:, 1], c=sampled_labels, cmap='viridis', alpha=0.5, s=0.5)
+            plt.colorbar(scatter, label='Leiden Label')
+            plt.title('Sampled Data by Leiden Label')
+            plt.xticks([])
+            plt.yticks([])
+            plt.savefig(f'/home/dfl32/project/ifm/umaps/ifm_leiden_{args.leiden}_sampled.png', bbox_inches='tight')
+            plt.close()
+
+        # plt.figure(figsize=(10, 8))
+        # scatter = plt.scatter(umap_generated[:, 0], umap_generated[:, 1], c=generated_labels, cmap='viridis', alpha=0.5, s=0.5)
+        # plt.colorbar(scatter, label='Leiden Label')
+        # plt.title('Generated Data by Leiden Label')
+        # plt.savefig(f'/home/dfl32/project/ifm/umaps/ifm_leiden_{args.leiden}_generated.png')
+        # plt.close()
+
+        if args.umap_embed:
+            pca_sampled_expression_data, cells = umap_embed(pca_sampled_expression_data, cells)
+
+        for gamma in args.mmd_gammas:
+            mmd = mmd_rbf(cells[:, :args.num_umap_dims], pca_sampled_expression_data[:, :args.num_umap_dims], gamma=gamma)
+            mmds[gamma].append(mmd)
+            logger.info(f"MMD (gamma={gamma}): {mmd}")
+
+        # Add adaptive MMD computation
+        adaptive_mmd = mmd_rbf_adaptive(cells[:, :args.num_umap_dims], pca_sampled_expression_data[:, :args.num_umap_dims], k=20)
+        adaptive_mmds.append(adaptive_mmd)
+        logger.info(f"Adaptive MMD (k=20): {adaptive_mmd}")
+
+        for reg in args.wass_regs:
+            wass = compute_wass(cells[:, :args.num_umap_dims], pca_sampled_expression_data[:, :args.num_umap_dims], reg=reg)
+            wassersteins[reg].append(wass)
+            logger.info(f"2-Wasserstein (reg={reg}): {wass}")
+
+    # Calculate means and standard deviations
     mean_classifier_entropy = np.mean(classifier_entropies)
     std_classifier_entropy = np.std(classifier_entropies)
     mean_classifier_kl_div = np.mean(classifier_kl_divs)
@@ -242,23 +352,34 @@ def main(args):
     std_classifier_tv = np.std(classifier_tv_distances)
     mean_label_kl_div = np.mean(label_kl_divs)
     std_label_kl_div = np.std(label_kl_divs)
+    mean_weighted_tv = np.mean(weighted_tv_distances)
+    std_weighted_tv = np.std(weighted_tv_distances)
+    mean_incep_score = np.mean(incep_scores)
+    std_incep_score = np.std(incep_scores)
+    mean_plausibility_score = np.mean(plausibility_scores)
+    std_plausibility_score = np.std(plausibility_scores)
+    mean_adaptive_mmd = np.mean(adaptive_mmds)
+    std_adaptive_mmd = np.std(adaptive_mmds)
 
-    logger.info(f"Mean Cluster Total Variation Distance: {mean_cluster_tv} ± {std_cluster_tv}")
+    # Log all means and standard deviations
     logger.info(f"Mean Classifier Average Entropy: {mean_classifier_entropy} ± {std_classifier_entropy}")
     logger.info(f"Mean Classifier KL Divergence: {mean_classifier_kl_div} ± {std_classifier_kl_div}")
     logger.info(f"Mean Classifier Total Variation Distance: {mean_classifier_tv} ± {std_classifier_tv}")
     logger.info(f"Mean Label Distribution KL Divergence: {mean_label_kl_div} ± {std_label_kl_div}")
+    logger.info(f"Mean Weighted Total Variation Distance: {mean_weighted_tv} ± {std_weighted_tv}")
+    logger.info(f"Mean Inception Score: {mean_incep_score} ± {std_incep_score}")
+    logger.info(f"Mean Plausibility Score: {mean_plausibility_score} ± {std_plausibility_score}")
+    logger.info(f"Mean Adaptive MMD (k=20): {mean_adaptive_mmd} ± {std_adaptive_mmd}")
 
-    # if args.umap_embed:
-    #     pca_sampled_expression_data, cells = umap_embed(pca_sampled_expression_data, cells)
+    for gamma in args.mmd_gammas:
+        mean_mmd = np.mean(mmds[gamma])
+        std_mmd = np.std(mmds[gamma])
+        logger.info(f"Mean MMD (gamma={gamma}): {mean_mmd} ± {std_mmd}")
 
-    # for gamma in args.mmd_gammas:
-    #     mmd = mmd_rbf(cells[:, :args.num_umap_dims], pca_sampled_expression_data[:, :args.num_umap_dims], gamma=gamma)
-    #     logger.info(f"MMD (gamma={gamma}): {mmd}")
-
-    # for reg in args.wass_regs:
-    #     wass = compute_wass(cells[:, :args.num_umap_dims], pca_sampled_expression_data[:, :args.num_umap_dims], reg=reg)
-    #     logger.info(f"2-Wasserstein (reg={reg}): {wass}")
+    for reg in args.wass_regs:
+        mean_wass = np.mean(wassersteins[reg])
+        std_wass = np.std(wassersteins[reg])
+        logger.info(f"Mean 2-Wasserstein (reg={reg}): {mean_wass} ± {std_wass}")
 
 if __name__ == "__main__":
     args = parse_arguments()
